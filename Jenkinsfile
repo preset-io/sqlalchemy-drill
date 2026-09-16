@@ -233,16 +233,14 @@ podTemplate(
                         secretKeyVariable: 'AWS_SECRET_ACCESS_KEY',
                     ]
                 ]) {
-                    // --if-none-match '*' makes this atomically fail (412) if
-                    // the key already exists, so a published artifact can never
-                    // be replaced.  s3 sync would overwrite; do not substitute it.
+                    // Jenkins has AWS CLI v1, which cannot express If-None-Match.
+                    // A current boto3 client preserves the same atomic 412 guard.
                     sh(
                         script: """
-                            aws s3api put-object \
-                              --bucket ${BUCKET} \
-                              --key ${LIB_NAME}/${wheelName} \
-                              --body upload/${LIB_NAME}/${wheelName} \
-                              --if-none-match '*'
+                            set -eu
+                            python -m pip install --quiet 'boto3>=1.36,<2'
+                            BUCKET='${BUCKET}' KEY='${LIB_NAME}/${wheelName}' ARTIFACT='upload/${LIB_NAME}/${wheelName}' \
+                              python -c 'import os, boto3; artifact = open(os.environ["ARTIFACT"], "rb"); boto3.client("s3").put_object(Bucket=os.environ["BUCKET"], Key=os.environ["KEY"], Body=artifact, IfNoneMatch="*")'
                         """,
                         label: 'Upload wheel (no-overwrite)'
                     )
