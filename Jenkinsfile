@@ -187,7 +187,15 @@ podTemplate(
                 // byte-reproducible from this exact revision.
                 sh(script: 'python -m pip install build twine', label: 'Install build tooling')
                 sh(
-                    script: 'SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)" python -m build',
+                    script: '''
+                        set -eu
+                        SOURCE_DATE_EPOCH="$(git -c safe.directory="$PWD" log -1 --pretty=%ct)"
+                        case "$SOURCE_DATE_EPOCH" in
+                            ''|*[!0-9]*) echo "invalid SOURCE_DATE_EPOCH: $SOURCE_DATE_EPOCH" >&2; exit 1 ;;
+                        esac
+                        export SOURCE_DATE_EPOCH
+                        python -m build
+                    ''',
                     label: 'Build wheel and sdist'
                 )
 
