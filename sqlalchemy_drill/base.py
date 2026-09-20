@@ -22,12 +22,18 @@
 from __future__ import absolute_import
 from __future__ import unicode_literals
 import logging
-from urllib.parse import unquote
+import re
+from time import sleep
+from urllib.parse import quote, unquote
 
+from requests import RequestException
 from sqlalchemy import exc, inspect, pool, text, types
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.sql import compiler
 from sqlalchemy.sql.elements import quoted_name
+
+from sqlalchemy_drill.drilldbapi._drilldbapi import Cursor as RestCursor
+from sqlalchemy_drill.drilldbapi.api_exceptions import DatabaseError
 
 logger = logging.getLogger('drilldbapi')
 
@@ -238,12 +244,22 @@ class DrillIdentifierPreparer(compiler.IdentifierPreparer):
         return quoted_table
 
 
+class DrillExecutionContext(default.DefaultExecutionContext):
+    def handle_dbapi_exception(self, error):
+        # Keep the failed REST cursor available even when execute() raises
+        # before SQLAlchemy can return a result. This also covers errors in
+        # trailing queryState during fetchall(). No profile request here.
+        if isinstance(self.cursor, RestCursor) and isinstance(error, DatabaseError):
+            error._drill_cursor = self.cursor
+
+
 class DrillDialect(default.DefaultDialect):
     name = 'drilldbapi'
     driver = 'rest'
     preparer = DrillIdentifierPreparer
     statement_compiler = DrillCompiler_sadrill
     type_compiler = DrillTypeCompiler_sadrill
+    execution_ctx_cls = DrillExecutionContext
     poolclass = pool.SingletonThreadPool
     supports_alter = False
     supports_pk_autoincrement = False
@@ -406,6 +422,13 @@ class DrillDialect(default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kwargs):
+        """Return whether Drill exposes the table.
+
+        Missing-object diagnostics alone cannot distinguish absence from
+        denied access. File absence additionally requires a fresh, complete,
+        nonempty listing of the containing directory under the same identity.
+        Empty or unavailable listings are not proof: preserve the probe error.
+        """
         schema = self._schema_name(connection, schema)
         curs = connection.execute(
             text(
@@ -421,35 +444,18 @@ class DrillDialect(default.DefaultDialect):
             rows = curs.fetchall()
         finally:
             curs.close()
-        if rows:
-            return True
-
-        # File-backed tables are discovered through SHOW FILES rather than
-        # INFORMATION_SCHEMA.TABLES.  Compare names in Python so that the file
-        # name never becomes executable SQL.
         info_cache = kwargs.get("info_cache")
-        if self.get_plugin_type(
-                connection, schema, info_cache=info_cache) == 'file':
-            if (
-                table_name in self.get_table_names(
-                    connection, schema, info_cache=info_cache)
-                or table_name in self.get_view_names(
-                    connection, schema, info_cache=info_cache)
-            ):
-                return True
-
-            # Classpath resources (notably cp.default) are queryable but are
-            # not returned by SHOW FILES.  Probe them through the same quoted
-            # identifier path used for dynamic column reflection.  A DBAPI
-            # failure cannot distinguish absence from permission/server errors
-            # when Drill suppresses error details, so DBAPI failures propagate.
+        plugin_type = self.get_plugin_type(
+            connection, schema, info_cache=info_cache)
+        if rows and plugin_type not in ('file', 'mongo', 'splunk', None):
+            return True
+        if plugin_type in ('file', 'mongo', 'splunk', None):
+            # Always probe: a directory entry is not proof of read access to
+            # the table. Unknown schemas also need a probe, not a false result.
             try:
-                return bool(self.get_columns(
-                    connection,
-                    table_name,
-                    schema,
-                    info_cache=info_cache,
-                ))
+                self.get_columns(connection, table_name, schema,
+                                 info_cache=info_cache)
+                return True
             except exc.NoSuchTableError:
                 return False
         return False
@@ -475,6 +481,128 @@ class DrillDialect(default.DefaultDialect):
             logger.warning(f"Unknown Drill data type: '{data_type}', using UserDefinedType")
             return types.UserDefinedType
 
+    @staticmethod
+    def _is_missing_object(error):
+        """Classify a failed REST probe, never a generic DBAPI failure."""
+        if error.connection_invalidated:
+            return False
+        cursor = getattr(error.orig, "_drill_cursor", None)
+        if cursor is None or cursor.result_md.get("queryState") != "FAILED":
+            return False
+        message = cursor.result_md.get("errorMessage")
+        if not message:
+            query_id = cursor.result_md.get("queryId")
+            if not isinstance(query_id, str) or not query_id:
+                return False
+            connection = cursor.connection
+            # Reuse the query's authenticated session and TLS settings, not a
+            # new requests session. Default Drill REST errors omit details.
+            # Drill publishes the final profile after returning query results.
+            # An immediate GET can see the still-active profile without error.
+            # Retry that incomplete profile briefly, but never infer absence
+            # from a profile that remains unknown or cannot be fetched.
+            for delay in (0, 0.1, 0.2):
+                if delay:
+                    sleep(delay)
+                try:
+                    with connection._session.get(
+                        f"{connection._base_url}/profiles/{quote(query_id, safe='')}.json",
+                        timeout=30,
+                    ) as response:
+                        response.raise_for_status()
+                        profile = response.json()
+                except (RequestException, ValueError):
+                    # Preserve the original DBAPI failure, unchanged.
+                    return False
+                if not isinstance(profile, dict):
+                    return False
+                message = profile.get("error")
+                if message:
+                    break
+        if not isinstance(message, str):
+            return False
+        # Match the error class AND the complete missing-object diagnostic.
+        # Do not search stack traces or turn other validation errors into absence.
+        return re.match(
+            r"\AVALIDATION ERROR: "
+            r"(?:From line \d+, column \d+ to line \d+, column \d+: )?"
+            r"Object '[^\r\n]+' not found(?: within '[^\r\n]+')?(?:\r?\n|\Z)",
+            message,
+        ) is not None
+
+    def _proves_file_absent(self, connection, schema, table_name):
+        """Corroborate a missing-object error without guessing permissions.
+
+        Drill 1.21.2 SHOW FILES uses non-recursive listAllSafe: an exception
+        becomes an empty list, not a partial list. A nonempty, fully consumed
+        listing therefore witnesses readability by the actual filesystem
+        identity (which need not be SESSION_USER). Never infer that identity
+        from a file owner, or trust mode bits without group/ACL information.
+        Empty directories, classpath resources and unavailable metadata remain
+        unprovable. Corroboration never uses cached directory listings.
+        """
+        if not schema or not isinstance(table_name, str):
+            return False
+        # Hadoop paths can be globs or URIs. Literal-name comparison cannot
+        # prove these absent; nor may normalization silently change the target.
+        if any(char in table_name for char in "*?[]{}\\:"):
+            return False
+        parts = table_name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            return False
+        try:
+            # attemptedAutoLimit covers the REST request, not a server-side
+            # exec.query.max_rows setting. Both must be unlimited.
+            limits = connection.execute(text(
+                "SELECT val FROM sys.options WHERE name = 'exec.query.max_rows'"
+            ))
+            try:
+                limit_rows = limits.fetchall()
+            finally:
+                limits.close()
+            if len(limit_rows) != 1 or str(limit_rows[0][0]) != "0":
+                return False
+            for index, name in enumerate(parts):
+                if index:
+                    # ./ prevents a child name from resolving as a workspace
+                    # when schema is a bare plugin rather than plugin.workspace.
+                    directory = self.identifier_preparer.format_drill_table(
+                        schema, "./" + "/".join(parts[:index]))
+                else:
+                    directory = self.identifier_preparer.format_drill_schema(schema)
+                result = connection.exec_driver_sql(f"SHOW FILES FROM {directory}")
+                try:
+                    cursor = result.cursor
+                    entries = result.mappings().all()
+                finally:
+                    result.close()
+                if (not isinstance(cursor, RestCursor)
+                        or cursor.result_md.get("queryState") != "COMPLETED"
+                        or cursor.result_md.get("attemptedAutoLimit") != 0):
+                    return False
+                if not entries or any(
+                    not isinstance(entry.get("name"), str)
+                    or not isinstance(entry.get("isDirectory"), bool)
+                    or not isinstance(entry.get("isFile"), bool)
+                    for entry in entries
+                ):
+                    return False
+                matches = [entry for entry in entries if entry["name"] == name]
+                # A view file can resolve the same table name. Its failure is
+                # not evidence that the table itself is absent.
+                if any(entry["name"] == name + ".view.drill" for entry in entries):
+                    return False
+                if not matches:
+                    return True
+                if index == len(parts) - 1 or not all(
+                    entry["isDirectory"] for entry in matches
+                ):
+                    return False
+        except (exc.SQLAlchemyError, RequestException, ValueError, KeyError, TypeError):
+            # Corroboration is best-effort; never replace the original error.
+            return False
+        return False
+
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
         result = []
@@ -484,7 +612,7 @@ class DrillDialect(default.DefaultDialect):
             connection, schema, info_cache=info_cache)
 
         # Plugins with dynamic schemas use ** notation - query data directly
-        if plugin_type in ('file', 'mongo', 'splunk'):
+        if plugin_type in ('file', 'mongo', 'splunk', None):
             quoted_file_name = self.identifier_preparer.format_drill_table(
                 schema, table_name)
 
@@ -499,18 +627,24 @@ class DrillDialect(default.DefaultDialect):
             # This SQL contains identifiers, not literal values.  Using
             # exec_driver_sql avoids text() treating a colon inside a quoted
             # identifier as a bind marker.
-            # Drill may omit error details, so a failed SELECT cannot prove
-            # absence. Keep permission, syntax, server and connection errors
-            # visible instead of misclassifying them as NoSuchTableError.
-            curs = connection.exec_driver_sql(q)
             try:
-                column_metadata = curs.cursor.description
-                # Metadata precedes rows and final queryState in REST results.
-                # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
-                # DBAPI errors are wrapped, and never cache failed reflection.
-                curs.fetchall()
-            finally:
-                curs.close()
+                curs = connection.exec_driver_sql(q)
+                try:
+                    column_metadata = curs.cursor.description
+                    # Metadata precedes rows and final queryState in REST results.
+                    # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
+                    # DBAPI errors are wrapped, and never cache failed reflection.
+                    curs.fetchall()
+                finally:
+                    curs.close()
+            except exc.DBAPIError as error:
+                if (self._is_missing_object(error)
+                        and plugin_type == "file"
+                        and self._proves_file_absent(connection, schema, table_name)):
+                    raise exc.NoSuchTableError(
+                        f"{schema + '.' if schema else ''}{table_name}"
+                    ) from error
+                raise
 
             for row in column_metadata:
                 # row[1] is a DBAPITypeObject - extract the type name from its values
