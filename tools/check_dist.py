@@ -5,6 +5,10 @@ Run as::
 
     python tools/check_dist.py dist --expected-version 1.1.11
 
+Print the same normalized version used by the checks (without reading artifacts)::
+
+    python tools/check_dist.py --print-normalized 1.1.11.1+PR-8.ab3bc46
+
 Checks, in order:
 
 * exactly one wheel and one sdist are present;
@@ -16,8 +20,7 @@ Checks, in order:
 * the sdist carries the test suite, its non-Python fixtures and the
   requirements files, so a source release can be tested.
 
-Only the standard library is used so this can run before anything is
-installed.
+Requires packaging, already installed by the CI test/build tooling.
 """
 import argparse
 import posixpath
@@ -25,6 +28,9 @@ import sys
 import tarfile
 import zipfile
 from email.parser import Parser
+
+from packaging.utils import canonicalize_version
+from packaging.version import Version
 
 EXPECTED_WHEEL_TOP_LEVEL = {'sqlalchemy_drill'}
 
@@ -60,6 +66,26 @@ def _fail(message):
     raise CheckFailed(message)
 
 
+def _normalized_version(value):
+    # Validate first: canonicalize_version alone leaves invalid strings unchanged.
+    # Compare PEP 440 versions, then apply setuptools' filename-component escaping.
+    return canonicalize_version(Version(value)).replace('-', '_').strip('_')
+
+
+def _matches_versioned_name(name, suffix, expected_version):
+    prefix = 'sqlalchemy_drill-'
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return False
+    end = -len(suffix) if suffix else None
+    return _normalized_version(name[len(prefix):end]) == _normalized_version(expected_version)
+
+
+def _matches_metadata_version(metadata, expected_version):
+    versions = metadata.get_all('Version', [])
+    return (len(versions) == 1
+            and _normalized_version(versions[0]) == _normalized_version(expected_version))
+
+
 def _check_archive_paths(names):
     normalized = [posixpath.normpath(name.rstrip('/')) for name in names]
     if any(canonical != raw.rstrip('/') or raw.startswith('/') or "\\" in raw
@@ -78,7 +104,12 @@ def check_wheel(wheel_path, expected_version):
         if any(name.startswith('/') or '..' in name.split('/') for name in names):
             _fail('wheel contains unsafe paths')
 
-        dist_info = f'sqlalchemy_drill-{expected_version}.dist-info'
+        dist_infos = {name.split('/')[0] for name in names
+                      if name.split('/')[0].endswith('.dist-info')}
+        if (len(dist_infos) != 1 or not _matches_versioned_name(
+                next(iter(dist_infos)), '.dist-info', expected_version)):
+            _fail('wheel must contain exactly one version-matching dist-info directory')
+        dist_info = next(iter(dist_infos))
         metadata_name = f'{dist_info}/METADATA'
         if metadata_name not in names:
             _fail(f'{wheel_path.name} has no {metadata_name}; '
@@ -88,7 +119,7 @@ def check_wheel(wheel_path, expected_version):
             archive.read(metadata_name).decode('utf-8'))
         if metadata.get_all('Name') != ['sqlalchemy_drill']:
             _fail('wheel METADATA must name sqlalchemy_drill exactly once')
-        if metadata.get_all('Version') != [expected_version]:
+        if not _matches_metadata_version(metadata, expected_version):
             _fail(f'wheel METADATA Version is {metadata["Version"]!r}, '
                   f'expected {expected_version!r}')
 
@@ -114,10 +145,14 @@ def check_wheel(wheel_path, expected_version):
 
 
 def check_sdist(sdist_path, expected_version):
-    root = f'sqlalchemy_drill-{expected_version}'
     with tarfile.open(sdist_path) as archive:
         members = archive.getmembers()
         names = archive.getnames()
+        roots = {name.split('/')[0] for name in names}
+        if (len(roots) != 1 or not _matches_versioned_name(
+                next(iter(roots)), '', expected_version)):
+            _fail('sdist must contain exactly one version-matching root')
+        root = next(iter(roots))
         _check_archive_paths(names)
         if len(names) != len(set(names)):
             _fail('sdist contains duplicate paths')
@@ -129,7 +164,7 @@ def check_sdist(sdist_path, expected_version):
             _fail('sdist has no regular root PKG-INFO')
         metadata = Parser().parsestr(archive.extractfile(metadata_path).read().decode('utf-8'))
         if (metadata.get_all('Name') != ['sqlalchemy_drill']
-                or metadata.get_all('Version') != [expected_version]):
+                or not _matches_metadata_version(metadata, expected_version)):
             _fail('sdist PKG-INFO name/version mismatch')
         for path in REQUIRED_SDIST_PATHS:
             name = f'{root}/{path}'
@@ -151,9 +186,24 @@ def check_sdist(sdist_path, expected_version):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('dist_dir', help='directory holding the built artifacts')
-    parser.add_argument('--expected-version', required=True)
+    parser.add_argument('dist_dir', nargs='?', help='directory holding the built artifacts')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--expected-version')
+    mode.add_argument('--print-normalized', metavar='VERSION',
+                      help='print the normalized version and exit')
     args = parser.parse_args(argv)
+
+    if args.print_normalized is not None:
+        if args.dist_dir is not None:
+            parser.error('dist_dir is not allowed with --print-normalized')
+        try:
+            print(_normalized_version(args.print_normalized))
+        except ValueError as error:
+            print(f'INVALID VERSION: {error}', file=sys.stderr)
+            return 1
+        return 0
+    if args.dist_dir is None:
+        parser.error('dist_dir is required with --expected-version')
 
     # pathlib import is local so --help works on a broken tree.
     from pathlib import Path
@@ -168,15 +218,21 @@ def main(argv=None):
           f'against version {args.expected_version}')
 
     try:
+        expected_version = _normalized_version(args.expected_version)
         expected_names = {
-            f'sqlalchemy_drill-{args.expected_version}-py3-none-any.whl',
-            f'sqlalchemy_drill-{args.expected_version}.tar.gz',
+            f'sqlalchemy_drill-{expected_version}-py3-none-any.whl',
+            f'sqlalchemy_drill-{expected_version}.tar.gz',
         }
-        if (len(artifacts) != 2 or {p.name for p in artifacts} != expected_names
+        if (len(artifacts) != 2
                 or any(p.is_symlink() or not p.is_file() for p in artifacts)):
             _fail(f'expected exactly two regular artifacts: {sorted(expected_names)}')
-        wheel = dist_dir / f'sqlalchemy_drill-{args.expected_version}-py3-none-any.whl'
-        sdist = dist_dir / f'sqlalchemy_drill-{args.expected_version}.tar.gz'
+        wheels = [p for p in artifacts if _matches_versioned_name(
+            p.name, '-py3-none-any.whl', expected_version)]
+        sdists = [p for p in artifacts if _matches_versioned_name(
+            p.name, '.tar.gz', expected_version)]
+        if len(wheels) != 1 or len(sdists) != 1:
+            _fail(f'expected exactly two regular artifacts: {sorted(expected_names)}')
+        wheel, sdist = wheels[0], sdists[0]
 
         check_wheel(wheel, args.expected_version)
         check_sdist(sdist, args.expected_version)
