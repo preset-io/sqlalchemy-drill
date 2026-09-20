@@ -22,12 +22,18 @@
 from __future__ import absolute_import
 from __future__ import unicode_literals
 import logging
-from urllib.parse import unquote
+import re
+from time import sleep
+from urllib.parse import quote, unquote
 
+from requests import RequestException
 from sqlalchemy import exc, inspect, pool, text, types
 from sqlalchemy.engine import default, reflection
 from sqlalchemy.sql import compiler
 from sqlalchemy.sql.elements import quoted_name
+
+from sqlalchemy_drill.drilldbapi._drilldbapi import Cursor as RestCursor
+from sqlalchemy_drill.drilldbapi.api_exceptions import DatabaseError
 
 logger = logging.getLogger('drilldbapi')
 
@@ -238,12 +244,22 @@ class DrillIdentifierPreparer(compiler.IdentifierPreparer):
         return quoted_table
 
 
+class DrillExecutionContext(default.DefaultExecutionContext):
+    def handle_dbapi_exception(self, error):
+        # Keep the failed REST cursor available even when execute() raises
+        # before SQLAlchemy can return a result. This also covers errors in
+        # trailing queryState during fetchall(). No profile request here.
+        if isinstance(self.cursor, RestCursor) and isinstance(error, DatabaseError):
+            error._drill_cursor = self.cursor
+
+
 class DrillDialect(default.DefaultDialect):
     name = 'drilldbapi'
     driver = 'rest'
     preparer = DrillIdentifierPreparer
     statement_compiler = DrillCompiler_sadrill
     type_compiler = DrillTypeCompiler_sadrill
+    execution_ctx_cls = DrillExecutionContext
     poolclass = pool.SingletonThreadPool
     supports_alter = False
     supports_pk_autoincrement = False
@@ -406,6 +422,16 @@ class DrillDialect(default.DefaultDialect):
 
     @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kwargs):
+        """Return whether Drill exposes the table.
+
+        A table you lack permission to read is reported as absent: Drill
+        returns the same missing-object VALIDATION diagnostic for both.
+        Live Drill 1.21.2 returned identical messages, exception classes and
+        profile errors for an absent file and an existing file beneath a
+        chmod 000 directory; SHOW FILES also succeeded with an empty listing.
+        This deliberate conflation cannot distinguish permission from absence.
+        Other query failures, including unknown failures, still raise.
+        """
         schema = self._schema_name(connection, schema)
         curs = connection.execute(
             text(
@@ -440,9 +466,8 @@ class DrillDialect(default.DefaultDialect):
 
             # Classpath resources (notably cp.default) are queryable but are
             # not returned by SHOW FILES.  Probe them through the same quoted
-            # identifier path used for dynamic column reflection.  A DBAPI
-            # failure cannot distinguish absence from permission/server errors
-            # when Drill suppresses error details, so DBAPI failures propagate.
+            # identifier path used for dynamic column reflection. Only Drill's
+            # missing-object VALIDATION diagnostic is treated as absence.
             try:
                 return bool(self.get_columns(
                     connection,
@@ -475,6 +500,55 @@ class DrillDialect(default.DefaultDialect):
             logger.warning(f"Unknown Drill data type: '{data_type}', using UserDefinedType")
             return types.UserDefinedType
 
+    @staticmethod
+    def _is_missing_object(error):
+        """Classify a failed REST probe, never a generic DBAPI failure."""
+        if error.connection_invalidated:
+            return False
+        cursor = getattr(error.orig, "_drill_cursor", None)
+        if cursor is None or cursor.result_md.get("queryState") != "FAILED":
+            return False
+        message = cursor.result_md.get("errorMessage")
+        if not message:
+            query_id = cursor.result_md.get("queryId")
+            if not isinstance(query_id, str) or not query_id:
+                return False
+            connection = cursor.connection
+            # Reuse the query's authenticated session and TLS settings, not a
+            # new requests session. Default Drill REST errors omit details.
+            # Drill publishes the final profile after returning query results.
+            # An immediate GET can see the still-active profile without error.
+            # Retry that incomplete profile briefly, but never infer absence
+            # from a profile that remains unknown or cannot be fetched.
+            for delay in (0, 0.1, 0.2):
+                if delay:
+                    sleep(delay)
+                try:
+                    with connection._session.get(
+                        f"{connection._base_url}/profiles/{quote(query_id, safe='')}.json",
+                        timeout=30,
+                    ) as response:
+                        response.raise_for_status()
+                        profile = response.json()
+                except (RequestException, ValueError):
+                    # Preserve the original DBAPI failure, unchanged.
+                    return False
+                if not isinstance(profile, dict):
+                    return False
+                message = profile.get("error")
+                if message:
+                    break
+        if not isinstance(message, str):
+            return False
+        # Match the error class AND the complete missing-object diagnostic.
+        # Do not search stack traces or turn other validation errors into absence.
+        return re.match(
+            r"\AVALIDATION ERROR: "
+            r"(?:From line \d+, column \d+ to line \d+, column \d+: )?"
+            r"Object '[^\r\n]+' not found(?: within '[^\r\n]+')?(?:\r?\n|\Z)",
+            message,
+        ) is not None
+
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
         result = []
@@ -499,18 +573,22 @@ class DrillDialect(default.DefaultDialect):
             # This SQL contains identifiers, not literal values.  Using
             # exec_driver_sql avoids text() treating a colon inside a quoted
             # identifier as a bind marker.
-            # Drill may omit error details, so a failed SELECT cannot prove
-            # absence. Keep permission, syntax, server and connection errors
-            # visible instead of misclassifying them as NoSuchTableError.
-            curs = connection.exec_driver_sql(q)
             try:
-                column_metadata = curs.cursor.description
-                # Metadata precedes rows and final queryState in REST results.
-                # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
-                # DBAPI errors are wrapped, and never cache failed reflection.
-                curs.fetchall()
-            finally:
-                curs.close()
+                curs = connection.exec_driver_sql(q)
+                try:
+                    column_metadata = curs.cursor.description
+                    # Metadata precedes rows and final queryState in REST results.
+                    # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
+                    # DBAPI errors are wrapped, and never cache failed reflection.
+                    curs.fetchall()
+                finally:
+                    curs.close()
+            except exc.DBAPIError as error:
+                if self._is_missing_object(error):
+                    raise exc.NoSuchTableError(
+                        f"{schema + '.' if schema else ''}{table_name}"
+                    ) from error
+                raise
 
             for row in column_metadata:
                 # row[1] is a DBAPITypeObject - extract the type name from its values

@@ -752,7 +752,10 @@ def streaming_rest_engine(monkeypatch):
     from sqlalchemy_drill.drilldbapi._drilldbapi import Connection
 
     state = python_types.SimpleNamespace(
-        query_state="FAILED", rows=[{"v": "1"}], cursors=[], calls=[]
+        query_state="FAILED", rows=[{"v": "1"}], cursors=[], calls=[],
+        failure_payload=None, leading_failure=False, transport_error=None,
+        profile_calls=[], profile_payload={}, profile_status=200,
+        profile_exception=None, incomplete_profiles=0,
     )
 
     def post(_url, *, data, **_kwargs):
@@ -772,15 +775,35 @@ def streaming_rest_engine(monkeypatch):
         elif query.startswith("SELECT 1") and state.probe == "fallback":
             rows = []
         else:
+            if state.transport_error:
+                raise state.transport_error
             query_state = state.query_state
         # The real Requests response and REST cursor parse rows before the
         # opaque trailing state, matching StreamingHttpConnection.finish().
         response = requests.Response()
         response.status_code = 200
-        response.raw = io.BytesIO(json.dumps({
+        payload = {
             "columns": columns, "metadata": metadata, "rows": rows,
             "queryState": query_state,
-        }).encode())
+        }
+        if query_state == "FAILED" and state.failure_payload is not None:
+            if state.leading_failure:
+                payload = dict(state.failure_payload)
+            else:
+                payload.update(state.failure_payload)
+        response.raw = io.BytesIO(json.dumps(payload).encode())
+        return response
+
+    def get(url, **kwargs):
+        state.profile_calls.append((url, kwargs))
+        if state.profile_exception:
+            raise state.profile_exception
+        response = requests.Response()
+        response.status_code = state.profile_status
+        payload = state.profile_payload
+        if len(state.profile_calls) <= state.incomplete_profiles:
+            payload = {"state": 4}
+        response.raw = io.BytesIO(json.dumps(payload).encode())
         return response
 
     original_cursor = Connection.cursor
@@ -793,6 +816,7 @@ def streaming_rest_engine(monkeypatch):
     monkeypatch.setattr(Connection, "cursor", cursor)
     session = requests.Session()
     monkeypatch.setattr(session, "post", post)
+    monkeypatch.setattr(session, "get", get)
     engine = create_engine(
         "drill+sadrill://localhost:8047/cp.default",
         creator=lambda: Connection("localhost", 8047, "http://", None, session),
@@ -843,3 +867,144 @@ def test_rest_reflection_exhausts_trailing_state(streaming_rest_engine, probe, r
         calls = len(state.calls)
         assert method(connection, "resource.json", "cp.default", info_cache=cache) == value
         assert len(state.calls) == calls
+
+
+# Sanitized diagnostic shape established against live Drill 1.21.2. The same
+# Object-not-found diagnostic was returned for an existing file under chmod 000.
+_MISSING_OBJECT = (
+    "VALIDATION ERROR: From line 1, column 15 to line 1, column 49: "
+    "Object 'sc121464_denied/data.json' not found within 'dfs.tmp'\n\n"
+)
+
+
+def _failed_reflection(state, message, verbose=False, leading=True):
+    state.probe = "fallback"
+    state.leading_failure = leading
+    state.failure_payload = {"queryId": "test-query-id", "queryState": "FAILED"}
+    if verbose:
+        state.failure_payload["errorMessage"] = message
+    state.profile_payload = {"error": message}
+
+
+def _reflect(engine, operation, table_name="resource.json"):
+    with engine.connect() as connection:
+        if operation == "autoload":
+            return Table(table_name, MetaData(), schema="cp.default",
+                         autoload_with=connection)
+        inspector = inspect(connection)
+        return getattr(inspector, operation)(table_name, schema="cp.default")
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("leading", [False, True])
+def test_missing_object_reflection_contract(streaming_rest_engine, operation,
+                                            verbose, leading):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT, verbose, leading)
+    if operation == "has_table":
+        assert _reflect(engine, operation) is False
+    else:
+        with pytest.raises(sa_exc.NoSuchTableError):
+            _reflect(engine, operation)
+    assert len(state.profile_calls) == (0 if verbose else 1)
+    if not verbose:
+        assert state.profile_calls[0] == (
+            "http://localhost:8047/profiles/test-query-id.json", {"timeout": 30}
+        )
+    assert all(not cursor._is_open for cursor in state.cursors)
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("verbose", [False, True])
+@pytest.mark.parametrize("message", [
+    "PARSE ERROR: Encountered unexpected token at line 1, column 1",
+    "PARSE ERROR: Object 'resource.json' not found",
+    "PERMISSION ERROR: Object 'resource.json' not found",
+    "SYSTEM ERROR: Object 'resource.json' not found",
+    "VALIDATION ERROR: Column 'bad_column' not found in any table",
+    "VALIDATION ERROR: Cannot apply operator to arguments",
+    "SYSTEM ERROR: failure\nVALIDATION ERROR: Object 'resource.json' not found",
+    "Object 'resource.json' not found",
+])
+def test_non_missing_failures_never_become_absence(streaming_rest_engine,
+                                                  operation, verbose, message):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, message, verbose)
+    with pytest.raises(sa_exc.DatabaseError, match="query state is FAILED") as caught:
+        _reflect(engine, operation)
+    # Preserve the actual DBAPI failure, not a replacement classification error.
+    assert caught.value.orig._drill_cursor.result_md == state.failure_payload
+    assert len(state.profile_calls) == (0 if verbose else 1)
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+def test_dead_server_is_never_absence(streaming_rest_engine, operation):
+    from requests import ConnectionError
+
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.transport_error = ConnectionError("server is unavailable")
+    with pytest.raises(ConnectionError) as caught:
+        _reflect(engine, operation)
+    assert caught.value is state.transport_error
+    assert state.profile_calls == []
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("problem", ["http", "transport", "json", "no_error", "not_object"])
+def test_unavailable_profile_preserves_failure(streaming_rest_engine, operation, problem):
+    from requests import ConnectionError
+
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    if problem == "http":
+        # Even an error response containing the diagnostic is not evidence.
+        state.profile_status = 403
+    elif problem == "transport":
+        state.profile_exception = ConnectionError("profile unavailable")
+    elif problem == "json":
+        state.profile_exception = ValueError("invalid JSON")
+    elif problem == "no_error":
+        state.profile_payload = {}
+    else:
+        state.profile_payload = []
+    with pytest.raises(sa_exc.DatabaseError, match="query state is FAILED"):
+        _reflect(engine, operation)
+    assert len(state.profile_calls) == (3 if problem == "no_error" else 1)
+
+
+def test_profile_publication_can_lag_failed_query(streaming_rest_engine, monkeypatch):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.incomplete_profiles = 2
+    delays = []
+    monkeypatch.setattr("sqlalchemy_drill.base.sleep", delays.append)
+    assert _reflect(engine, "has_table") is False
+    assert len(state.profile_calls) == 3
+    assert delays == [0.1, 0.2]
+
+
+@pytest.mark.parametrize("verbose", [False, True])
+def test_permission_denied_deliberately_reads_as_absent(streaming_rest_engine, verbose):
+    # Accepted limitation, not a permissions classifier: live Drill 1.21.2
+    # returned this identical diagnostic/class/profile error for an existing
+    # file beneath chmod 000 and real absence. SHOW FILES also returned [].
+    # Pin both public outcomes so changing the decision fails loudly.
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
+    assert _reflect(engine, "has_table", "sc121464_denied/data.json") is False
+    with pytest.raises(sa_exc.NoSuchTableError):
+        _reflect(engine, "autoload", "sc121464_denied/data.json")
+
+
+def test_success_and_ordinary_query_errors_never_fetch_profiles(streaming_rest_engine):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    with engine.connect() as connection:
+        with pytest.raises(sa_exc.DatabaseError):
+            connection.exec_driver_sql("SELECT * FROM cp.default.t LIMIT 1")
+    assert state.profile_calls == []
+    state.query_state = "COMPLETED"
+    assert _reflect(engine, "has_table") is True
+    assert state.profile_calls == []

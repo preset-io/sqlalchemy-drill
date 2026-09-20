@@ -1,3 +1,29 @@
+## [1.1.11.2] - unreleased
+
+### Fixed
+
+- REST reflection treats only missing-object `VALIDATION ERROR` diagnostics as
+  absence: `has_table()` returns `False`, and `get_columns()` / autoload raises
+  `NoSuchTableError`. When `errorMessage` is omitted (Drill's default), fetch
+  `/profiles/{queryId}.json` on the failure path using the query's session.
+  Briefly retry incomplete profiles because Drill publishes final profiles
+  after returning query results.
+  Syntax, transport, other error classes and unknown failures still raise;
+  an unavailable or unclassifiable profile preserves the original failure.
+
+### Known limitation: permission denial is reported as absence
+
+- **A table you lack permission to read is reported as absent.** Drill returns
+  the same missing-object diagnostic for permission denial and real absence;
+  this fix deliberately accepts that conflation and does not distinguish them.
+  Live Drill 1.21.2 evidence: an existing file under a `chmod 000` directory and
+  an absent file produced identical missing-object messages, exception classes
+  and profile errors. `SHOW FILES` on the unreadable directory also returned
+  `COMPLETED` with `rows: []`, so an empty listing cannot resolve the ambiguity.
+  With default REST verbosity, both (and syntax errors) returned HTTP 200 with
+  only `queryId` and `queryState: FAILED`; profiles distinguished missing-object
+  `VALIDATION ERROR` from `PARSE ERROR`, but not permission denial from absence.
+
 ## [1.1.11] - unreleased
 
 ### Fixed

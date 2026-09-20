@@ -54,10 +54,7 @@ def test_rest_query_and_reflection(drill_conn):
         "description",
     ]
     assert inspector.has_table("employee.json", schema="cp.default")
-    # With verbose errors disabled, absence is indistinguishable from other
-    # server failures. Reflection must preserve that error, not report False.
-    with pytest.raises(sa_exc.DBAPIError):
-        inspector.has_table("missing.json", schema="cp.default")
+    assert not inspector.has_table("missing.json", schema="cp.default")
 
 
 def test_schema_qualified_select_executes(drill_conn):
@@ -96,8 +93,8 @@ def test_bare_plugin_schema_reflects(drill_conn):
     assert inspector.get_table_names(schema="dfs")
 
 
-def test_opaque_missing_file_failure_remains_a_dbapi_error(drill_conn):
-    with pytest.raises(sa_exc.DBAPIError):
+def test_missing_file_autoload_raises_no_such_table(drill_conn):
+    with pytest.raises(sa_exc.NoSuchTableError):
         Table(
             "definitely_missing.json",
             MetaData(),
@@ -164,10 +161,8 @@ def test_injection_shaped_identifiers_stay_identifiers(drill_conn):
         "a%b",
         "naïve",
     ):
-        # The missing identifier must fail, without suppressing an opaque
-        # server error as a successful absence check.
-        with pytest.raises(sa_exc.DBAPIError):
-            inspector.has_table(table_name, schema="dfs.tmp")
+        # These remain single missing identifiers, never executable SQL.
+        assert not inspector.has_table(table_name, schema="dfs.tmp")
 
 
 def test_readiness_retries_a_slow_starting_http_endpoint(monkeypatch):
