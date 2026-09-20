@@ -22,6 +22,7 @@
 import os
 import time
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 import requests
@@ -58,7 +59,22 @@ def wait_for_http_up(drill_container):
 
 
 @pytest.fixture(scope="session")
-def drill_container():
+def drill_auth_file():
+    test_dir = Path(__file__).parent.absolute()
+    # Keep bind mounts beside the existing fixtures: a Docker daemon may not
+    # share the test process's private /tmp (for example with systemd).
+    with TemporaryDirectory(prefix=".drill-auth-", dir=test_dir) as directory:
+        # Only a disposable administrator alias changes REST options. Reuse
+        # the existing test-only hash without modifying the source fixture.
+        users = (test_dir / "htpasswd").read_text()
+        htpasswd = Path(directory) / "htpasswd"
+        password_hash = users.splitlines()[0].split(":", 1)[1]
+        htpasswd.write_text(users.rstrip() + "\ndrilluser:" + password_hash + "\n")
+        yield htpasswd
+
+
+@pytest.fixture(scope="session")
+def drill_container(drill_auth_file):
     if os.environ.get("DRILL_RUN_REST_INTEGRATION") != "1":
         pytest.skip("set DRILL_RUN_REST_INTEGRATION=1 for Apache Drill tests")
     # Once the run has explicitly opted in, a missing dependency is a failure
@@ -77,7 +93,7 @@ def drill_container():
     )
     drill_container.with_exposed_ports(8047)\
         .with_volume_mapping(test_dir/"drill-override.conf", "/opt/drill/conf/drill-override.conf")\
-        .with_volume_mapping(test_dir/"htpasswd", "/opt/drill/conf/htpasswd")\
+        .with_volume_mapping(drill_auth_file, "/opt/drill/conf/htpasswd")\
         .with_kwargs(entrypoint="/bin/bash")\
         .with_command(["-c", "$DRILL_HOME/bin/drill-embedded -n dbapi -p foo -f <(sleep infinity)"])
 

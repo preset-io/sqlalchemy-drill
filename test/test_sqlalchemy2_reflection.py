@@ -898,7 +898,11 @@ def _failed_reflection(state, message, verbose=False, leading=True):
     state.leading_failure = leading
     state.failure_payload = {"queryId": "test-query-id", "queryState": "FAILED"}
     if verbose:
-        state.failure_payload["errorMessage"] = message
+        # Verbose REST messages omit the class and repeat the diagnostic;
+        # only the profile carries the authoritative VALIDATION ERROR prefix.
+        diagnostic = message.split(" ERROR: ", 1)[-1].strip()
+        cause = diagnostic.split(": ", 1)[-1]
+        state.failure_payload["errorMessage"] = diagnostic + ": " + cause
     state.profile_payload = {"error": message}
 
 
@@ -923,11 +927,9 @@ def test_missing_object_reflection_contract(streaming_rest_engine, operation,
     else:
         with pytest.raises(sa_exc.NoSuchTableError):
             _reflect(engine, operation)
-    assert len(state.profile_calls) == (0 if verbose else 1)
-    if not verbose:
-        assert state.profile_calls[0] == (
-            "http://localhost:8047/profiles/test-query-id.json", {"timeout": 30}
-        )
+    assert state.profile_calls == [(
+        "http://localhost:8047/profiles/test-query-id.json", {"timeout": 30}
+    )]
     assert all(not cursor._is_open for cursor in state.cursors)
 
 
@@ -942,6 +944,7 @@ def test_missing_object_reflection_contract(streaming_rest_engine, operation,
     "VALIDATION ERROR: Cannot apply operator to arguments",
     "SYSTEM ERROR: failure\nVALIDATION ERROR: Object 'resource.json' not found",
     "Object 'resource.json' not found",
+    _MISSING_OBJECT.removeprefix("VALIDATION ERROR: "),
 ])
 def test_non_missing_failures_never_become_absence(streaming_rest_engine,
                                                   operation, verbose, message):
@@ -951,15 +954,44 @@ def test_non_missing_failures_never_become_absence(streaming_rest_engine,
         _reflect(engine, operation)
     # Preserve the actual DBAPI failure, not a replacement classification error.
     assert caught.value.orig._drill_cursor.result_md == state.failure_payload
-    assert len(state.profile_calls) == (0 if verbose else 1)
+    assert len(state.profile_calls) == 1
+
+
+def test_classified_inline_message_needs_no_profile(streaming_rest_engine):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.failure_payload["errorMessage"] = _MISSING_OBJECT
+    assert _reflect(engine, "has_table") is False
+    assert state.profile_calls == []
+
+
+@pytest.mark.parametrize("query_id", [None, "", 123])
+def test_unclassified_inline_message_without_query_id_is_not_absence(
+        streaming_rest_engine, query_id):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT, verbose=True)
+    state.failure_payload["queryId"] = query_id
+    with pytest.raises(sa_exc.DatabaseError):
+        _reflect(engine, "has_table")
+    assert state.profile_calls == []
+
+
+@pytest.mark.parametrize("message", [None, "", 123, {}, "unclassified error"])
+def test_unclassified_inline_message_still_uses_profile(streaming_rest_engine, message):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.failure_payload["errorMessage"] = message
+    assert _reflect(engine, "has_table") is False
+    assert len(state.profile_calls) == 1
 
 
 @pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
-def test_dead_server_is_never_absence(streaming_rest_engine, operation):
+@pytest.mark.parametrize("verbose", [False, True])
+def test_dead_server_is_never_absence(streaming_rest_engine, verbose, operation):
     from requests import ConnectionError
 
     engine, state = streaming_rest_engine
-    _failed_reflection(state, _MISSING_OBJECT)
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
     state.transport_error = ConnectionError("server is unavailable")
     with pytest.raises(ConnectionError) as caught:
         _reflect(engine, operation)
@@ -969,11 +1001,13 @@ def test_dead_server_is_never_absence(streaming_rest_engine, operation):
 
 @pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
 @pytest.mark.parametrize("problem", ["http", "transport", "json", "no_error", "not_object"])
-def test_unavailable_profile_preserves_failure(streaming_rest_engine, operation, problem):
+@pytest.mark.parametrize("verbose", [False, True])
+def test_unavailable_profile_preserves_failure(
+        streaming_rest_engine, verbose, operation, problem):
     from requests import ConnectionError
 
     engine, state = streaming_rest_engine
-    _failed_reflection(state, _MISSING_OBJECT)
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
     if problem == "http":
         # Even an error response containing the diagnostic is not evidence.
         state.profile_status = 403
@@ -990,9 +1024,11 @@ def test_unavailable_profile_preserves_failure(streaming_rest_engine, operation,
     assert len(state.profile_calls) == (3 if problem == "no_error" else 1)
 
 
-def test_profile_publication_can_lag_failed_query(streaming_rest_engine, monkeypatch):
+@pytest.mark.parametrize("verbose", [False, True])
+def test_profile_publication_can_lag_failed_query(
+        streaming_rest_engine, verbose, monkeypatch):
     engine, state = streaming_rest_engine
-    _failed_reflection(state, _MISSING_OBJECT)
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
     state.incomplete_profiles = 2
     delays = []
     monkeypatch.setattr("sqlalchemy_drill.base.sleep", delays.append)
@@ -1020,12 +1056,13 @@ def test_permission_denied_raises(streaming_rest_engine, verbose, operation):
     "empty", "present", "view", "malformed", "failed", "transport", "limited",
     "mongo", "unknown_schema", "server_limit",
 ])
-def test_unproven_absence_preserves_original_error(streaming_rest_engine,
+@pytest.mark.parametrize("verbose", [False, True])
+def test_unproven_absence_preserves_original_error(streaming_rest_engine, verbose,
                                                   operation, problem):
     from requests import ConnectionError
 
     engine, state = streaming_rest_engine
-    _failed_reflection(state, _MISSING_OBJECT)
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
     if problem == "empty":
         state.listings = {}
     elif problem in ("present", "view"):
@@ -1072,9 +1109,11 @@ def test_nested_absence_requires_readable_ancestor(streaming_rest_engine, missin
     assert _reflect(engine, "has_table", "dir/missing.json") is False
 
 
-def test_success_and_ordinary_query_errors_never_fetch_profiles(streaming_rest_engine):
+@pytest.mark.parametrize("verbose", [False, True])
+def test_success_and_ordinary_query_errors_never_fetch_profiles(
+        streaming_rest_engine, verbose):
     engine, state = streaming_rest_engine
-    _failed_reflection(state, _MISSING_OBJECT)
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
     with engine.connect() as connection:
         with pytest.raises(sa_exc.DatabaseError):
             connection.exec_driver_sql("SELECT * FROM cp.default.t LIMIT 1")

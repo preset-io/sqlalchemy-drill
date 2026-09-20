@@ -489,46 +489,51 @@ class DrillDialect(default.DefaultDialect):
         cursor = getattr(error.orig, "_drill_cursor", None)
         if cursor is None or cursor.result_md.get("queryState") != "FAILED":
             return False
-        message = cursor.result_md.get("errorMessage")
-        if not message:
-            query_id = cursor.result_md.get("queryId")
-            if not isinstance(query_id, str) or not query_id:
-                return False
-            connection = cursor.connection
-            # Reuse the query's authenticated session and TLS settings, not a
-            # new requests session. Default Drill REST errors omit details.
-            # Drill publishes the final profile after returning query results.
-            # An immediate GET can see the still-active profile without error.
-            # Retry that incomplete profile briefly, but never infer absence
-            # from a profile that remains unknown or cannot be fetched.
-            for delay in (0, 0.1, 0.2):
-                if delay:
-                    sleep(delay)
-                try:
-                    with connection._session.get(
-                        f"{connection._base_url}/profiles/{quote(query_id, safe='')}.json",
-                        timeout=30,
-                    ) as response:
-                        response.raise_for_status()
-                        profile = response.json()
-                except (RequestException, ValueError):
-                    # Preserve the original DBAPI failure, unchanged.
-                    return False
-                if not isinstance(profile, dict):
-                    return False
-                message = profile.get("error")
-                if message:
-                    break
-        if not isinstance(message, str):
+
+        def is_missing(message):
+            # Match the class AND the complete missing-object diagnostic.
+            # Never search stack traces or accept an unknown error class.
+            return isinstance(message, str) and re.match(
+                r"\AVALIDATION ERROR: "
+                r"(?:From line \d+, column \d+ to line \d+, column \d+: )?"
+                r"Object '[^\r\n]+' not found(?: within '[^\r\n]+')?(?:\r?\n|\Z)",
+                message,
+            ) is not None
+
+        if is_missing(cursor.result_md.get("errorMessage")):
+            return True
+        # Default REST responses omit errorMessage; verbose responses include
+        # it but omit the class prefix. Either way, an unclassified message
+        # needs the authoritative profile, not a weaker diagnostic match.
+        query_id = cursor.result_md.get("queryId")
+        if not isinstance(query_id, str) or not query_id:
             return False
-        # Match the error class AND the complete missing-object diagnostic.
-        # Do not search stack traces or turn other validation errors into absence.
-        return re.match(
-            r"\AVALIDATION ERROR: "
-            r"(?:From line \d+, column \d+ to line \d+, column \d+: )?"
-            r"Object '[^\r\n]+' not found(?: within '[^\r\n]+')?(?:\r?\n|\Z)",
-            message,
-        ) is not None
+        connection = cursor.connection
+        # Reuse the query's authenticated session and TLS settings, not a
+        # new requests session. This is only reached for failed REST probes.
+        # Drill publishes the final profile after returning query results.
+        # An immediate GET can see the still-active profile without error.
+        # Retry that incomplete profile briefly, but never infer absence
+        # from a profile that remains unknown or cannot be fetched.
+        for delay in (0, 0.1, 0.2):
+            if delay:
+                sleep(delay)
+            try:
+                with connection._session.get(
+                    f"{connection._base_url}/profiles/{quote(query_id, safe='')}.json",
+                    timeout=30,
+                ) as response:
+                    response.raise_for_status()
+                    profile = response.json()
+            except (RequestException, ValueError):
+                # Preserve the original DBAPI failure, unchanged.
+                return False
+            if not isinstance(profile, dict):
+                return False
+            message = profile.get("error")
+            if message:
+                return is_missing(message)
+        return False
 
     def _proves_file_absent(self, connection, schema, table_name):
         """Corroborate a missing-object error without guessing permissions.

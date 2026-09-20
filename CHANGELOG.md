@@ -1,3 +1,16 @@
+## [1.1.11.3] - unreleased
+
+### Fixed
+
+- Classify absent REST tables with verbose errors enabled as well as with the
+  default non-verbose setting. When `errorMessage` cannot prove a missing-object
+  `VALIDATION ERROR`, consult the query profile even if that message is nonempty:
+  verbose Drill responses omit the authoritative error-class prefix.
+- Keep the strict class check and fresh, complete, readable nonempty directory
+  corroboration. Permission, syntax, transport and unprovable failures still
+  raise; successful queries never fetch profiles. Exercise both REST error
+  settings against Apache Drill 1.21.2 and reset the option after testing.
+
 ## [1.1.11.2] - unreleased
 
 ### Fixed
