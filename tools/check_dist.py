@@ -5,6 +5,10 @@ Run as::
 
     python tools/check_dist.py dist --expected-version 1.1.11
 
+Print the same normalized version used by the checks (without reading artifacts)::
+
+    python tools/check_dist.py --print-normalized 1.1.11.1+PR-8.ab3bc46
+
 Checks, in order:
 
 * exactly one wheel and one sdist are present;
@@ -182,9 +186,24 @@ def check_sdist(sdist_path, expected_version):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('dist_dir', help='directory holding the built artifacts')
-    parser.add_argument('--expected-version', required=True)
+    parser.add_argument('dist_dir', nargs='?', help='directory holding the built artifacts')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--expected-version')
+    mode.add_argument('--print-normalized', metavar='VERSION',
+                      help='print the normalized version and exit')
     args = parser.parse_args(argv)
+
+    if args.print_normalized is not None:
+        if args.dist_dir is not None:
+            parser.error('dist_dir is not allowed with --print-normalized')
+        try:
+            print(_normalized_version(args.print_normalized))
+        except ValueError as error:
+            print(f'INVALID VERSION: {error}', file=sys.stderr)
+            return 1
+        return 0
+    if args.dist_dir is None:
+        parser.error('dist_dir is required with --expected-version')
 
     # pathlib import is local so --help works on a broken tree.
     from pathlib import Path

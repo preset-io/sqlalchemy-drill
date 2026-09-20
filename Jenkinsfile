@@ -31,7 +31,7 @@
 //
 //   * master      -> stable 1.1.11.1.  Published ONLY from reviewed, merged
 //                    Preset history.
-//   * PR branches -> 1.1.11.1+PR-<n>.<shortsha>, a PEP 440 local version that
+//   * PR branches -> 1.1.11.1+pr.<n>.<shortsha>, a PEP 440 local version that
 //                    is deliberately NOT a stable release.  A PR build can
 //                    never emit the bare stable version; this is asserted
 //                    below rather than left to convention.
@@ -122,6 +122,18 @@ podTemplate(
                     error("Refusing to build stable version ${baseVersion} from branch " +
                           "'${env.BRANCH_NAME}'. Stable releases are published only from master.")
                 }
+
+                // Use the artifact checker's normalization, not a second set
+                // of PEP 440 rules in Groovy. Normalize before stamping the
+                // package or deriving any artifact filename or upload key.
+                // Keep the stable-version guard above this conversion so a
+                // spelling-only change cannot make a branch look non-stable.
+                sh(script: 'python -m pip install packaging', label: 'Install version tooling')
+                publishVersion = sh(
+                        script: "python tools/check_dist.py --print-normalized '${publishVersion}'",
+                        returnStdout: true,
+                        label: 'Normalize publish version'
+                ).trim()
                 if (isPullRequest && !publishVersion.contains('+')) {
                     error("PR build produced a non-local version ${publishVersion}; refusing.")
                 }

@@ -155,3 +155,47 @@ def test_reject_missing_artifact(tmp_path, name):
 def test_reject_invalid_or_duplicate_metadata_version(tmp_path, field, version):
     make_dist(tmp_path, **{field: version})
     assert check(tmp_path) == 1
+
+
+@pytest.mark.parametrize("raw, normalized", [
+    ("1.1.11.1", "1.1.11.1"),
+    ("1.1.11.1+PR-8.ab3bc46", "1.1.11.1+pr.8.ab3bc46"),
+    ("1.1.11.1+PR_8.AB3BC46", "1.1.11.1+pr.8.ab3bc46"),
+    ("v1.0.0RC1", "1rc1"),
+    ("1.0-1", "1.post1"),
+    ("2!1.0.0+BUILD_007", "2!1+build.7"),
+])
+def test_print_normalized(tmp_path, monkeypatch, capsys, raw, normalized):
+    monkeypatch.chdir(tmp_path)  # No artifacts are needed in print-only mode.
+    assert check_dist.main(["--print-normalized", raw]) == 0
+    output = capsys.readouterr()
+    assert output.out == normalized + "\n"
+    assert output.err == ""
+    assert check_dist._normalized_version(normalized) == normalized
+
+    # The printed value can be used unchanged for stamping, filenames and checks.
+    make_dist(tmp_path, artifact_version=normalized,
+              wheel_version=normalized, sdist_version=normalized)
+    assert check(tmp_path, normalized) == 0
+
+
+@pytest.mark.parametrize("version", ["not-a-version", "", "1.1.11.1+PR-8/invalid"])
+def test_print_normalized_rejects_invalid_version(capsys, version):
+    assert check_dist.main(["--print-normalized", version]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "INVALID VERSION:" in output.err
+
+
+@pytest.mark.parametrize("argv", [
+    [],
+    ["dist"],
+    ["--expected-version", VERSION],
+    ["--print-normalized"],
+    ["dist", "--print-normalized", VERSION],
+    ["--print-normalized", VERSION, "--expected-version", VERSION],
+])
+def test_cli_rejects_invalid_modes(argv):
+    with pytest.raises(SystemExit) as error:
+        check_dist.main(argv)
+    assert error.value.code == 2
