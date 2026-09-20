@@ -365,10 +365,11 @@ def test_literal_reflection_values_are_bound_and_not_in_sql(fake_engine):
     engine, state = fake_engine
     malicious_schema = "prod?' OR 1=1 --:schema"
     malicious_table = "users?' OR 1=1 --:table"
+    state.plugin_types[malicious_schema] = "jdbc"
 
     with engine.connect() as connection:
         dialect = connection.dialect
-        assert dialect.get_plugin_type(connection, malicious_schema) is None
+        assert dialect.get_plugin_type(connection, malicious_schema) == "jdbc"
         assert dialect.get_table_names(connection, malicious_schema) == ()
         assert dialect.get_view_names(connection, malicious_schema) == ()
         with pytest.raises(sa_exc.NoSuchTableError):
@@ -756,6 +757,9 @@ def streaming_rest_engine(monkeypatch):
         failure_payload=None, leading_failure=False, transport_error=None,
         profile_calls=[], profile_payload={}, profile_status=200,
         profile_exception=None, incomplete_profiles=0,
+        listings={"": [{"name": "sibling.json", "isDirectory": False,
+                         "isFile": True}]}, listing_state="COMPLETED",
+        listing_limit=0, listing_error=None, plugin_type="file", max_rows="0",
     )
 
     def post(_url, *, data, **_kwargs):
@@ -768,9 +772,20 @@ def streaming_rest_engine(monkeypatch):
             rows = [{"version": "1.21.2"}]
         elif "INFORMATION_SCHEMA.`SCHEMATA`" in query:
             columns, metadata = ["SCHEMA_NAME", "TYPE"], ["VARCHAR"] * 2
-            plugin_type = "jdbc" if state.probe == "exists" else "file"
-            rows = [{"SCHEMA_NAME": "cp.default", "TYPE": plugin_type}]
-        elif "SHOW FILES" in query or "INFORMATION_SCHEMA.`VIEWS`" in query:
+            plugin_type = "jdbc" if state.probe == "exists" else state.plugin_type
+            rows = ([{"SCHEMA_NAME": "cp.default", "TYPE": plugin_type}]
+                    if plugin_type is not None else [])
+        elif "FROM sys.options" in query:
+            columns, metadata, rows = ["val"], ["VARCHAR"], [{"val": state.max_rows}]
+        elif "SHOW FILES" in query:
+            if state.listing_error:
+                raise state.listing_error
+            columns = ["name", "isDirectory", "isFile"]
+            metadata = ["VARCHAR", "BIT", "BIT"]
+            directory = query.removeprefix('SHOW FILES FROM cp.`default`')
+            rows = state.listings.get(directory, [])
+            query_state = state.listing_state
+        elif "INFORMATION_SCHEMA.`VIEWS`" in query:
             rows = []
         elif query.startswith("SELECT 1") and state.probe == "fallback":
             rows = []
@@ -785,6 +800,7 @@ def streaming_rest_engine(monkeypatch):
         payload = {
             "columns": columns, "metadata": metadata, "rows": rows,
             "queryState": query_state,
+            "attemptedAutoLimit": state.listing_limit if "SHOW FILES" in query else 0,
         }
         if query_state == "FAILED" and state.failure_payload is not None:
             if state.leading_failure:
@@ -986,16 +1002,74 @@ def test_profile_publication_can_lag_failed_query(streaming_rest_engine, monkeyp
 
 
 @pytest.mark.parametrize("verbose", [False, True])
-def test_permission_denied_deliberately_reads_as_absent(streaming_rest_engine, verbose):
-    # Accepted limitation, not a permissions classifier: live Drill 1.21.2
-    # returned this identical diagnostic/class/profile error for an existing
-    # file beneath chmod 000 and real absence. SHOW FILES also returned [].
-    # Pin both public outcomes so changing the decision fails loudly.
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+def test_permission_denied_raises(streaming_rest_engine, verbose, operation):
+    # The parent lists the directory, but the denied directory's successful
+    # empty listing is indistinguishable from a readable empty directory.
     engine, state = streaming_rest_engine
     _failed_reflection(state, _MISSING_OBJECT, verbose)
-    assert _reflect(engine, "has_table", "sc121464_denied/data.json") is False
-    with pytest.raises(sa_exc.NoSuchTableError):
-        _reflect(engine, "autoload", "sc121464_denied/data.json")
+    state.listings = {"": [{"name": "sc121464_denied", "isDirectory": True,
+                            "isFile": False}], ".`./sc121464_denied`": []}
+    with pytest.raises(sa_exc.DatabaseError) as caught:
+        _reflect(engine, operation, "sc121464_denied/data.json")
+    assert caught.value.orig._drill_cursor.result_md == state.failure_payload
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("problem", [
+    "empty", "present", "view", "malformed", "failed", "transport", "limited",
+    "mongo", "unknown_schema", "server_limit",
+])
+def test_unproven_absence_preserves_original_error(streaming_rest_engine,
+                                                  operation, problem):
+    from requests import ConnectionError
+
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    if problem == "empty":
+        state.listings = {}
+    elif problem in ("present", "view"):
+        name = "resource.json" + (".view.drill" if problem == "view" else "")
+        state.listings = {"": [{"name": name, "isDirectory": False, "isFile": True}]}
+    elif problem == "malformed":
+        state.listings = {"": [{"name": None}]}
+    elif problem == "failed":
+        state.listing_state = "FAILED"
+    elif problem == "transport":
+        state.listing_error = ConnectionError("listing unavailable")
+    elif problem == "limited":
+        state.listing_limit = 1
+    elif problem == "server_limit":
+        state.max_rows = "1"
+    elif problem == "mongo":
+        state.plugin_type = "mongo"
+    elif problem == "unknown_schema":
+        state.plugin_type = None
+    with pytest.raises(sa_exc.DatabaseError) as caught:
+        _reflect(engine, operation)
+    assert caught.value.orig._drill_cursor.result_md == state.failure_payload
+    assert all(not cursor._is_open for cursor in state.cursors)
+
+
+@pytest.mark.parametrize("name", ["../x", "/x", "a//b", "a/./b", "a*", "a?b",
+                                  "a[b]", "a{b,c}", "a:b", "a\\b"])
+def test_nonliteral_paths_are_not_proven_absent(streaming_rest_engine, name):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    with pytest.raises(sa_exc.DatabaseError):
+        _reflect(engine, "has_table", name)
+    assert not any("SHOW FILES" in query for query in state.calls)
+
+
+@pytest.mark.parametrize("missing_parent", [False, True])
+def test_nested_absence_requires_readable_ancestor(streaming_rest_engine, missing_parent):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    if not missing_parent:
+        state.listings[""].append({"name": "dir", "isDirectory": True, "isFile": False})
+        state.listings[".`./dir`"] = [{"name": "sibling.json", "isDirectory": False,
+                                   "isFile": True}]
+    assert _reflect(engine, "has_table", "dir/missing.json") is False
 
 
 def test_success_and_ordinary_query_errors_never_fetch_profiles(streaming_rest_engine):

@@ -2,27 +2,32 @@
 
 ### Fixed
 
-- REST reflection treats only missing-object `VALIDATION ERROR` diagnostics as
-  absence: `has_table()` returns `False`, and `get_columns()` / autoload raises
-  `NoSuchTableError`. When `errorMessage` is omitted (Drill's default), fetch
-  `/profiles/{queryId}.json` on the failure path using the query's session.
-  Briefly retry incomplete profiles because Drill publishes final profiles
-  after returning query results.
-  Syntax, transport, other error classes and unknown failures still raise;
-  an unavailable or unclassifiable profile preserves the original failure.
-
-### Known limitation: permission denial is reported as absence
-
-- **A table you lack permission to read is reported as absent.** Drill returns
-  the same missing-object diagnostic for permission denial and real absence;
-  this fix deliberately accepts that conflation and does not distinguish them.
-  Live Drill 1.21.2 evidence: an existing file under a `chmod 000` directory and
-  an absent file produced identical missing-object messages, exception classes
-  and profile errors. `SHOW FILES` on the unreadable directory also returned
-  `COMPLETED` with `rows: []`, so an empty listing cannot resolve the ambiguity.
-  With default REST verbosity, both (and syntax errors) returned HTTP 200 with
-  only `queryId` and `queryState: FAILED`; profiles distinguished missing-object
-  `VALIDATION ERROR` from `PARSE ERROR`, but not permission denial from absence.
+- REST file reflection reports absence only when proven: a missing-object
+  `VALIDATION ERROR` must be corroborated by a fresh, complete, nonempty
+  `SHOW FILES` listing that does not contain the requested name (or view).
+  Traverse nested paths through readable ancestors; reject limited listings
+  and paths whose glob/URI semantics cannot be checked by literal comparison.
+  The nonempty listing witnesses readability under the actual filesystem
+  identity, without guessing that identity from session users or file owners.
+  Proven absence returns `False` from `has_table()` and raises `NoSuchTableError`
+  from `get_columns()` / autoload.
+- Permission denial and unproven absence preserve the original query error.
+  In particular, empty listings, classpath resources without listings, unknown
+  schemas, and failed or malformed corroboration never turn an error into
+  absence. File existence probes read the table rather than accepting a
+  directory entry as proof of access.
+- Keep failure-path profile classification via `/profiles/{queryId}.json` when
+  default REST responses omit `errorMessage`, using the query's authenticated
+  session and briefly retrying late-published profiles. Syntax, transport,
+  other error classes and unavailable or unclassifiable profiles still raise.
+- Verify against Drill 1.21.2 that both `SHOW FILES` and
+  `INFORMATION_SCHEMA.FILES` expose directory, permission, owner and group
+  metadata. Those bits alone do not establish effective access: session user
+  and file owner can both differ from the drillbit filesystem user, and these
+  listings do not supply its group membership or effective ACLs. Empty listings
+  remain unproven. Live regressions assert that a typo in a populated readable
+  directory is absent, while an existing file beneath a `chmod 000` directory
+  raises through `has_table()`, column reflection and autoload.
 
 ## [1.1.11] - unreleased
 

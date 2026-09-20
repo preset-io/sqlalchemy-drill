@@ -424,13 +424,10 @@ class DrillDialect(default.DefaultDialect):
     def has_table(self, connection, table_name, schema=None, **kwargs):
         """Return whether Drill exposes the table.
 
-        A table you lack permission to read is reported as absent: Drill
-        returns the same missing-object VALIDATION diagnostic for both.
-        Live Drill 1.21.2 returned identical messages, exception classes and
-        profile errors for an absent file and an existing file beneath a
-        chmod 000 directory; SHOW FILES also succeeded with an empty listing.
-        This deliberate conflation cannot distinguish permission from absence.
-        Other query failures, including unknown failures, still raise.
+        Missing-object diagnostics alone cannot distinguish absence from
+        denied access. File absence additionally requires a fresh, complete,
+        nonempty listing of the containing directory under the same identity.
+        Empty or unavailable listings are not proof: preserve the probe error.
         """
         schema = self._schema_name(connection, schema)
         curs = connection.execute(
@@ -447,34 +444,18 @@ class DrillDialect(default.DefaultDialect):
             rows = curs.fetchall()
         finally:
             curs.close()
-        if rows:
-            return True
-
-        # File-backed tables are discovered through SHOW FILES rather than
-        # INFORMATION_SCHEMA.TABLES.  Compare names in Python so that the file
-        # name never becomes executable SQL.
         info_cache = kwargs.get("info_cache")
-        if self.get_plugin_type(
-                connection, schema, info_cache=info_cache) == 'file':
-            if (
-                table_name in self.get_table_names(
-                    connection, schema, info_cache=info_cache)
-                or table_name in self.get_view_names(
-                    connection, schema, info_cache=info_cache)
-            ):
-                return True
-
-            # Classpath resources (notably cp.default) are queryable but are
-            # not returned by SHOW FILES.  Probe them through the same quoted
-            # identifier path used for dynamic column reflection. Only Drill's
-            # missing-object VALIDATION diagnostic is treated as absence.
+        plugin_type = self.get_plugin_type(
+            connection, schema, info_cache=info_cache)
+        if rows and plugin_type not in ('file', 'mongo', 'splunk', None):
+            return True
+        if plugin_type in ('file', 'mongo', 'splunk', None):
+            # Always probe: a directory entry is not proof of read access to
+            # the table. Unknown schemas also need a probe, not a false result.
             try:
-                return bool(self.get_columns(
-                    connection,
-                    table_name,
-                    schema,
-                    info_cache=info_cache,
-                ))
+                self.get_columns(connection, table_name, schema,
+                                 info_cache=info_cache)
+                return True
             except exc.NoSuchTableError:
                 return False
         return False
@@ -549,6 +530,79 @@ class DrillDialect(default.DefaultDialect):
             message,
         ) is not None
 
+    def _proves_file_absent(self, connection, schema, table_name):
+        """Corroborate a missing-object error without guessing permissions.
+
+        Drill 1.21.2 SHOW FILES uses non-recursive listAllSafe: an exception
+        becomes an empty list, not a partial list. A nonempty, fully consumed
+        listing therefore witnesses readability by the actual filesystem
+        identity (which need not be SESSION_USER). Never infer that identity
+        from a file owner, or trust mode bits without group/ACL information.
+        Empty directories, classpath resources and unavailable metadata remain
+        unprovable. Corroboration never uses cached directory listings.
+        """
+        if not schema or not isinstance(table_name, str):
+            return False
+        # Hadoop paths can be globs or URIs. Literal-name comparison cannot
+        # prove these absent; nor may normalization silently change the target.
+        if any(char in table_name for char in "*?[]{}\\:"):
+            return False
+        parts = table_name.split("/")
+        if any(part in ("", ".", "..") for part in parts):
+            return False
+        try:
+            # attemptedAutoLimit covers the REST request, not a server-side
+            # exec.query.max_rows setting. Both must be unlimited.
+            limits = connection.execute(text(
+                "SELECT val FROM sys.options WHERE name = 'exec.query.max_rows'"
+            ))
+            try:
+                limit_rows = limits.fetchall()
+            finally:
+                limits.close()
+            if len(limit_rows) != 1 or str(limit_rows[0][0]) != "0":
+                return False
+            for index, name in enumerate(parts):
+                if index:
+                    # ./ prevents a child name from resolving as a workspace
+                    # when schema is a bare plugin rather than plugin.workspace.
+                    directory = self.identifier_preparer.format_drill_table(
+                        schema, "./" + "/".join(parts[:index]))
+                else:
+                    directory = self.identifier_preparer.format_drill_schema(schema)
+                result = connection.exec_driver_sql(f"SHOW FILES FROM {directory}")
+                try:
+                    cursor = result.cursor
+                    entries = result.mappings().all()
+                finally:
+                    result.close()
+                if (not isinstance(cursor, RestCursor)
+                        or cursor.result_md.get("queryState") != "COMPLETED"
+                        or cursor.result_md.get("attemptedAutoLimit") != 0):
+                    return False
+                if not entries or any(
+                    not isinstance(entry.get("name"), str)
+                    or not isinstance(entry.get("isDirectory"), bool)
+                    or not isinstance(entry.get("isFile"), bool)
+                    for entry in entries
+                ):
+                    return False
+                matches = [entry for entry in entries if entry["name"] == name]
+                # A view file can resolve the same table name. Its failure is
+                # not evidence that the table itself is absent.
+                if any(entry["name"] == name + ".view.drill" for entry in entries):
+                    return False
+                if not matches:
+                    return True
+                if index == len(parts) - 1 or not all(
+                    entry["isDirectory"] for entry in matches
+                ):
+                    return False
+        except (exc.SQLAlchemyError, RequestException, ValueError, KeyError, TypeError):
+            # Corroboration is best-effort; never replace the original error.
+            return False
+        return False
+
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
         result = []
@@ -558,7 +612,7 @@ class DrillDialect(default.DefaultDialect):
             connection, schema, info_cache=info_cache)
 
         # Plugins with dynamic schemas use ** notation - query data directly
-        if plugin_type in ('file', 'mongo', 'splunk'):
+        if plugin_type in ('file', 'mongo', 'splunk', None):
             quoted_file_name = self.identifier_preparer.format_drill_table(
                 schema, table_name)
 
@@ -584,7 +638,9 @@ class DrillDialect(default.DefaultDialect):
                 finally:
                     curs.close()
             except exc.DBAPIError as error:
-                if self._is_missing_object(error):
+                if (self._is_missing_object(error)
+                        and plugin_type == "file"
+                        and self._proves_file_absent(connection, schema, table_name)):
                     raise exc.NoSuchTableError(
                         f"{schema + '.' if schema else ''}{table_name}"
                     ) from error
