@@ -29,6 +29,14 @@
 - When `request_timeout` expires, the driver now cancels the timed-out
   statement on the server (found by its tag) instead of leaving it running.
 
+### Added
+
+- `Cursor.cancel_group` (optional, 32 lowercase hex characters) marks every
+  statement the cursor runs with a shared ID in addition to its own tag, and
+  `Connection.cancel_query_group(id)` cancels whichever of them is running.
+  This suits callers that must choose a cancel ID before execution starts,
+  such as a SQL editor's "Stop" button, possibly from another connection.
+
 ## [1.1.11.4] - unreleased
 
 ### Breaking change

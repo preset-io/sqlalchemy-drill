@@ -1756,3 +1756,56 @@ def test_untrusted_certificate_error_names_the_migration(monkeypatch, verify, wh
     assert "verify_ssl=<path to the CA bundle" in message
     # The driver never retries without verification.
     assert session.verify == verify
+
+
+def test_cancel_group_marks_every_statement_and_cancels_only_its_running_ones():
+    session = _RunningSession([])
+    connection, queries = _tagging_connection(session)
+    cursor = connection.cursor()
+    group = "ab" * 16
+    cursor.cancel_group = group
+    cursor.execute("SELECT 1")
+    first = cursor.query_tag
+    cursor.execute("SELECT 2")
+    second = cursor.query_tag
+    assert queries[-2:] == [f"/* sqlalchemy-drill:{first} group:{group} */ SELECT 1",
+                            f"/* sqlalchemy-drill:{second} group:{group} */ SELECT 2"]
+    session.running = [
+        {"queryId": "mine", "query": f"/* sqlalchemy-drill:{second} group:{group} */ SELECT 2"},
+        {"queryId": "other-group", "query": f"/* sqlalchemy-drill:{'1' * 32} group:{'cd' * 16} */ SELECT 2"},
+        {"queryId": "untagged", "query": f"SELECT 'group:{group} */'"},
+    ]
+    session.gets.clear()
+    assert connection.cancel_query_group(group) is True
+    assert [url for url, _ in session.gets if "/cancel/" in url] == [
+        "http://h:8047/profiles/cancel/mine"]
+    # The per-statement cancel still finds a grouped statement by its own tag.
+    session.gets.clear()
+    assert cursor.cancel() is True
+    assert [url for url, _ in session.gets if "/cancel/" in url] == [
+        "http://h:8047/profiles/cancel/mine"]
+
+
+@pytest.mark.parametrize("bad", ["", "x" * 32, "AB" * 16, "ab", "ab" * 16 + " */ DROP"])
+def test_cancel_group_must_be_a_plain_hex_id(bad):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    session = _RunningSession([])
+    connection, _ = _tagging_connection(session)
+    cursor = connection.cursor()
+    cursor.cancel_group = bad
+    if bad:
+        with pytest.raises(_drilldbapi.ProgrammingError, match="cancel_group"):
+            cursor.execute("SELECT 1")
+    with pytest.raises(_drilldbapi.ProgrammingError, match="cancel_group"):
+        connection.cancel_query_group(bad)
+
+
+def test_cancel_group_with_nothing_running_returns_false(monkeypatch):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    monkeypatch.setattr(_drilldbapi, "sleep", lambda _s: None)
+    session = _RunningSession([])
+    connection, _ = _tagging_connection(session)
+    assert connection.cancel_query_group("ef" * 16) is False
+    assert not any("/cancel/" in url for url, _ in session.gets)
