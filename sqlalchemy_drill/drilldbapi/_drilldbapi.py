@@ -20,10 +20,12 @@ from json import dumps
 from math import isfinite
 from numbers import Integral, Real
 from typing import List
+from urllib.parse import quote
 
 from ijson import parse
 from ijson.common import ObjectBuilder
 from requests import Session, Response
+from requests.exceptions import Timeout
 
 from . import api_globals
 from .api_exceptions import (
@@ -482,8 +484,30 @@ class Cursor:
     @is_open
     def get_query_id(self) -> str:
         """Unofficial convenience method for getting the Drill ID of the last query.
+
+        Drill's REST API sends the ID together with the first result batch,
+        so it is None until the query has started returning results.
         """
-        return self._query_id
+        return self.result_md.get('queryId')
+
+    def cancel(self):
+        """Ask Drill to cancel this cursor's running query.
+
+        Safe to call from another thread while rows are being fetched.
+        Drill's REST API reports a query's ID only with its first result
+        batch, so a query that has not produced one yet (for example a large
+        aggregation still computing) cannot be identified, and hence cannot
+        be cancelled, through REST. Returns True iff Drill reports that it
+        cancelled the query.
+        """
+        query_id = self.result_md.get('queryId')
+        if not query_id:
+            raise NotSupportedError(
+                'Drill REST has not sent this query\'s ID yet (it arrives with '
+                'the first result batch), so the query cannot be cancelled.',
+                None
+            )
+        return self.connection.cancel_query(query_id)
 
     @is_open
     def get_column_names(self) -> List:
@@ -516,7 +540,8 @@ class Connection:
                  proto: str,
                  impersonation_target: str,
                  session: Session,
-                 stream_results: bool = True):
+                 stream_results: bool = True,
+                 request_timeout: float = None):
         if session is None:
             raise ProgrammingError('A Requests session is required.', None)
 
@@ -525,6 +550,9 @@ class Connection:
         self._connected = True
         self._impersonation_target = impersonation_target
         self._stream_results = stream_results
+        # None (the default) keeps the historical behaviour: no client-side
+        # limit, so a stalled server blocks the caller indefinitely.
+        self._request_timeout = request_timeout
 
         logger.debug('queries Drill\'s version number...')
         resp = self.submit_query(
@@ -559,13 +587,19 @@ class Connection:
         logger.debug(f'sends an HTTP POST with payload (stream={stream})')
         logger.debug(payload)
 
-        resp = self._session.post(
-            f'{self._base_url}/query.json',
-            data=dumps(payload),
-            headers=api_globals._HEADER,
-            timeout=None,
-            stream=stream
-        )
+        try:
+            resp = self._session.post(
+                f'{self._base_url}/query.json',
+                data=dumps(payload),
+                headers=api_globals._HEADER,
+                timeout=self._request_timeout,
+                stream=stream
+            )
+        except Timeout as ex:
+            raise OperationalError(
+                f'Drill REST request timed out after {self._request_timeout} s',
+                None
+            ) from ex
 
         logger.debug('received an HTTP response with body:')
         logger.debug(resp.text)
@@ -604,6 +638,33 @@ class Connection:
             raise ConnectionClosedException('Failed to close connection') from ex
 
     @connected
+    def cancel_query(self, query_id: str) -> bool:
+        """Cancel a running query by ID with Drill's REST cancel endpoint.
+
+        Returns True iff Drill reports that it cancelled the query; False if
+        the query is no longer running or Drill could not locate it.
+        """
+        try:
+            resp = self._session.get(
+                f'{self._base_url}/profiles/cancel/{quote(query_id, safe="")}',
+                timeout=self._request_timeout or 30,
+            )
+        except Timeout as ex:
+            raise OperationalError(
+                f'Drill REST cancel request timed out for query {query_id}', None
+            ) from ex
+        if resp.status_code != 200:
+            raise OperationalError(
+                f'Drill REST cancel request failed for query {query_id}',
+                resp.status_code
+            )
+        message = resp.text
+        logger.info(f'cancel request for {query_id}: {message}')
+        return (message.startswith('Cancelled query ')
+                or (' canceled on node ' in message
+                    and message.startswith('Query ')))
+
+    @connected
     def commit(self):
         logger.debug('commit is a no-op in this driver.')
 
@@ -622,7 +683,8 @@ def connect(host: str,
             drillpass: str = None,
             verify_ssl: bool = False,
             impersonation_target: str = None,
-            stream_results: bool = True
+            stream_results: bool = True,
+            request_timeout: float = None
             ) -> Connection:
     """
     Establishes a connection with an Apache Drill server.
@@ -644,6 +706,9 @@ def connect(host: str,
     impersonation_target (str, optional): The impersonation target to use for the connection. If provided, operations
                                            will be performed as the specified user.
     stream_results (bool, optional): Flag to enable or disable streaming of query results. Defaults to True.
+    request_timeout (float, optional): Seconds to wait for Drill to accept a connection or send the next response
+                                       bytes on every REST request. A timeout raises OperationalError. Defaults to
+                                       None: no limit, the historical behaviour.
 
     Returns:
     Connection: An object representing the established connection to the Apache Drill server.
@@ -652,6 +717,14 @@ def connect(host: str,
     DatabaseError: If the connection to the Apache Drill server could not be established or an error occurs with the server.
     AuthError: If authentication fails due to invalid username or password.
     """
+    if request_timeout is not None:
+        try:
+            request_timeout = float(request_timeout)
+        except (TypeError, ValueError):
+            request_timeout = float('nan')
+        if not isfinite(request_timeout) or request_timeout <= 0:
+            raise ProgrammingError(
+                'request_timeout must be a positive number of seconds', None)
     session = Session()
 
     session.verify = verify_ssl
@@ -668,19 +741,19 @@ def connect(host: str,
         payload['userName'] = impersonation_target
 
         payload['query'] = 'show schemas'
-        response = session.post(
-            f'{base_url}/query.json',
-            data=dumps(payload),
-            headers=api_globals._HEADER
-        )
+        login = dict(url=f'{base_url}/query.json', data=dumps(payload),
+                     headers=api_globals._HEADER)
     else:
         payload = api_globals._LOGIN.copy()
         payload['j_username'] = drilluser
         payload['j_password'] = drillpass
-        response = session.post(
-            f'{base_url}/j_security_check',
-            data=payload
-        )
+        login = dict(url=f'{base_url}/j_security_check', data=payload)
+    try:
+        response = session.post(timeout=request_timeout, **login)
+    except Timeout as ex:
+        raise OperationalError(
+            f'Drill REST request timed out after {request_timeout} s', None
+        ) from ex
 
     if response.status_code != 200:
         logger.error('was unable to connect to Drill.')
@@ -694,7 +767,8 @@ def connect(host: str,
         logger.error('failed to authenticate to Drill.')
         raise AuthError(str(raw_data), response.status_code)
 
-    conn = Connection(host, port, proto, impersonation_target, session, stream_results)
+    conn = Connection(host, port, proto, impersonation_target, session,
+                      stream_results, request_timeout)
     if db is not None:
         conn.submit_query(f'USE {db}')
 

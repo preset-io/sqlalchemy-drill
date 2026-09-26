@@ -1010,9 +1010,10 @@ def test_dead_server_is_never_absence(streaming_rest_engine, verbose, operation)
 @pytest.mark.parametrize("problem", ["http", "transport", "json", "no_error", "not_object"])
 @pytest.mark.parametrize("verbose", [False, True])
 def test_unavailable_profile_preserves_failure(
-        streaming_rest_engine, verbose, operation, problem):
+        streaming_rest_engine, verbose, operation, problem, monkeypatch):
     from requests import ConnectionError
 
+    monkeypatch.setattr("sqlalchemy_drill.base.sleep", lambda _delay: None)
     engine, state = streaming_rest_engine
     _failed_reflection(state, _MISSING_OBJECT, verbose)
     if problem == "http":
@@ -1028,7 +1029,7 @@ def test_unavailable_profile_preserves_failure(
         state.profile_payload = []
     with pytest.raises(sa_exc.DatabaseError, match="query state is FAILED"):
         _reflect(engine, operation)
-    assert len(state.profile_calls) == (3 if problem == "no_error" else 1)
+    assert len(state.profile_calls) == (7 if problem == "no_error" else 1)
 
 
 @pytest.mark.parametrize("verbose", [False, True])
@@ -1042,6 +1043,41 @@ def test_profile_publication_can_lag_failed_query(
     assert _reflect(engine, "has_table") is False
     assert len(state.profile_calls) == 3
     assert delays == [0.1, 0.2]
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("verbose", [False, True])
+def test_busy_server_profile_lag_still_proves_absence(
+        streaming_rest_engine, verbose, operation, monkeypatch):
+    # A busy server published the failed profile's error only after 0.3 s:
+    # the opaque REST failure must still become proven absence, not a
+    # DatabaseError, once the authoritative profile arrives.
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
+    state.incomplete_profiles = 5
+    delays = []
+    monkeypatch.setattr("sqlalchemy_drill.base.sleep", delays.append)
+    if operation == "has_table":
+        assert _reflect(engine, operation) is False
+    else:
+        with pytest.raises(sa_exc.NoSuchTableError):
+            _reflect(engine, operation)
+    assert len(state.profile_calls) == 6
+    assert delays == [0.1, 0.2, 0.4, 0.8, 1.6]
+    assert sum(delays) > 0.3
+
+
+def test_profile_that_never_publishes_an_error_is_bounded(
+        streaming_rest_engine, monkeypatch):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.incomplete_profiles = 100
+    delays = []
+    monkeypatch.setattr("sqlalchemy_drill.base.sleep", delays.append)
+    with pytest.raises(sa_exc.DatabaseError, match="query state is FAILED"):
+        _reflect(engine, "has_table")
+    assert len(state.profile_calls) == 7
+    assert sum(delays) == pytest.approx(5.1)
 
 
 @pytest.mark.parametrize("verbose", [False, True])
@@ -1188,3 +1224,133 @@ def test_rest_verify_ssl_is_absent_unless_configured():
     _args, kwargs = DrillDialect_sadrill().create_connect_args(
         make_url("drill+sadrill://h:8047/dfs/tmp?use_ssl=true"))
     assert "verify_ssl" not in kwargs
+
+
+class _RecordingSession:
+    """Minimal requests.Session stand-in that records request timeouts."""
+
+    def __init__(self, fail_on=None):
+        self.timeouts = []
+        self.fail_on = fail_on
+        self.verify = False
+
+    def post(self, url, **kwargs):
+        import io
+        import json
+
+        import requests
+
+        self.timeouts.append(kwargs.get("timeout"))
+        if self.fail_on and self.fail_on in url and len(self.timeouts) > 1:
+            raise requests.exceptions.ReadTimeout("read timed out")
+        response = requests.Response()
+        response.status_code = 200
+        body = {"columns": ["version"], "metadata": ["VARCHAR"],
+                "rows": [{"version": "1.21.2"}], "queryState": "COMPLETED"}
+        response.raw = io.BytesIO(json.dumps(body).encode())
+        return response
+
+
+@pytest.mark.parametrize("configured,expected", [(None, None), ("2.5", 2.5), (7, 7.0)])
+def test_rest_request_timeout_is_opt_in_and_reaches_every_request(
+        monkeypatch, configured, expected):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    session = _RecordingSession()
+    monkeypatch.setattr(_drilldbapi, "Session", lambda: session)
+    kwargs = {} if configured is None else {"request_timeout": configured}
+    connection = _drilldbapi.connect("h", 8047, **kwargs)
+    connection.submit_query("SELECT 1")
+    # login probe, version query, then the explicit query
+    assert session.timeouts == [expected] * 3
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "soon"])
+def test_rest_request_timeout_rejects_non_positive_or_non_numeric(value):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    with pytest.raises(_drilldbapi.ProgrammingError, match="request_timeout"):
+        _drilldbapi.connect("h", 8047, request_timeout=value)
+
+
+def test_rest_request_timeout_raises_operational_error(monkeypatch):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    session = _RecordingSession(fail_on="query.json")
+    monkeypatch.setattr(_drilldbapi, "Session", lambda: session)
+    connection = _drilldbapi.Connection(
+        "h", 8047, "http://", None, session, request_timeout=1.5)
+    with pytest.raises(_drilldbapi.OperationalError, match="timed out after 1.5 s"):
+        connection.submit_query("SELECT 1")
+
+
+def test_rest_request_timeout_url_value_reaches_connect():
+    from sqlalchemy.engine import make_url
+
+    _args, kwargs = DrillDialect_sadrill().create_connect_args(
+        make_url("drill+sadrill://h:8047/dfs/tmp?request_timeout=30"))
+    assert kwargs["request_timeout"] == "30"
+    _args, kwargs = DrillDialect_sadrill().create_connect_args(
+        make_url("drill+sadrill://h:8047/dfs/tmp"))
+    assert "request_timeout" not in kwargs
+
+
+class _CancelSession(_RecordingSession):
+    def __init__(self, reply="Cancelled query q-1 on locally running node.",
+                 status=200):
+        super().__init__()
+        self.reply, self.status, self.gets = reply, status, []
+
+    def get(self, url, **kwargs):
+        import io
+
+        import requests
+
+        self.gets.append((url, kwargs))
+        response = requests.Response()
+        response.status_code = self.status
+        response.raw = io.BytesIO(self.reply.encode())
+        return response
+
+
+@pytest.mark.parametrize("reply,expected", [
+    ("Cancelled query q/1 on locally running node.", True),
+    ("Query q/1 canceled on node drillbit-2.", True),
+    ("Attempted to cancel query q/1 on drillbit-2 but the query is no longer "
+     "active on that node.", False),
+    ("Failure attempting to cancel query q/1.  Unable to find information about "
+     "where query is actively running.", False),
+])
+def test_rest_cancel_query_uses_the_cancel_endpoint(reply, expected):
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    session = _CancelSession(reply)
+    connection = _drilldbapi.Connection("h", 8047, "http://", None, session)
+    assert connection.cancel_query("q/1") is expected
+    assert session.gets == [("http://h:8047/profiles/cancel/q%2F1", {"timeout": 30})]
+
+
+def test_rest_cancel_query_http_failure_is_operational_error():
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    connection = _drilldbapi.Connection(
+        "h", 8047, "http://", None, _CancelSession("denied", status=403))
+    with pytest.raises(_drilldbapi.OperationalError, match="cancel request failed"):
+        connection.cancel_query("q-1")
+
+
+def test_cursor_cancel_needs_the_query_id_from_the_first_batch():
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    session = _CancelSession()
+    connection = _drilldbapi.Connection(
+        "h", 8047, "http://", None, session, request_timeout=4)
+    cursor = connection.cursor()
+    assert cursor.get_query_id() is None
+    with pytest.raises(_drilldbapi.NotSupportedError, match="first result batch"):
+        cursor.cancel()
+    assert session.gets == []
+    cursor.result_md["queryId"] = "q-1"
+    assert cursor.get_query_id() == "q-1"
+    assert cursor.cancel() is True
+    assert session.gets == [("http://h:8047/profiles/cancel/q-1", {"timeout": 4})]

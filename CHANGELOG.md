@@ -14,8 +14,25 @@
   spellings now become booleans; any other value is still a CA bundle path.
   The default (no `verify_ssl`) is unchanged.
 
+- A provably absent file-backed table could surface as the opaque
+  `DatabaseError` instead of `False` / `NoSuchTableError` on a busy server:
+  the failed query's profile was read for only about 0.3 s before its error
+  was published. The profile is now polled with backoff for about 5 s. The
+  opaque REST error text is still never treated as evidence, because
+  permission and other failures produce the same text.
+- `Cursor.get_query_id()` raised `AttributeError`; it now returns the query
+  ID once Drill has sent it, else `None`.
+
 ### Added
 
+- Opt-in `request_timeout=<seconds>` connection option (URL query parameter)
+  applied to every REST request; a timeout raises `OperationalError`. Without
+  it nothing changes: there is no client-side limit, as before.
+- `Cursor.cancel()` and `Connection.cancel_query(query_id)` cancel a running
+  query through Drill's `/profiles/cancel/{queryId}` endpoint. Drill's REST
+  API sends the query ID only with the first result batch, so a query that
+  has not produced a batch yet cannot be cancelled through REST;
+  `Cursor.cancel()` raises `NotSupportedError` in that case.
 - `get_view_definition()` returns the stored view SQL from
   `INFORMATION_SCHEMA.VIEWS` (bound schema and view name) instead of raising
   `NotImplementedError`; an unknown view raises `NoSuchTableError`.

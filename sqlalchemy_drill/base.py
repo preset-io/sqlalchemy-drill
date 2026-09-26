@@ -37,6 +37,9 @@ from sqlalchemy_drill.drilldbapi.api_exceptions import DatabaseError
 
 logger = logging.getLogger('drilldbapi')
 
+# Delays (seconds) before each query-profile read while its error is unpublished.
+_PROFILE_RETRY_DELAYS = (0, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0)
+
 
 _type_map = {
     'bit': types.BOOLEAN,
@@ -536,10 +539,14 @@ class DrillDialect(default.DefaultDialect):
         # Reuse the query's authenticated session and TLS settings, not a
         # new requests session. This is only reached for failed REST probes.
         # Drill publishes the final profile after returning query results.
-        # An immediate GET can see the still-active profile without error.
-        # Retry that incomplete profile briefly, but never infer absence
-        # from a profile that remains unknown or cannot be fetched.
-        for delay in (0, 0.1, 0.2):
+        # An immediate GET can see the still-active profile without error;
+        # on a busy server that window exceeded 0.3 s, and a provably absent
+        # table then surfaced as the opaque DatabaseError. The opaque REST
+        # text itself is identical for permission and other failures, so it
+        # is never evidence. Poll the profile with backoff (about 5 s in
+        # total) and never infer absence from a profile that remains unknown
+        # or cannot be fetched.
+        for delay in _PROFILE_RETRY_DELAYS:
             if delay:
                 sleep(delay)
             try:
