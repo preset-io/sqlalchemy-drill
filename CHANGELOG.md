@@ -1,4 +1,54 @@
+## [1.1.11.5] - unreleased
+
+### Fixed
+
+- Reflection of dynamic-schema plugins such as Kafka returned only the
+  `**` placeholder column that INFORMATION_SCHEMA publishes for them. When
+  that placeholder is the only column, the real columns are now read from a
+  `SELECT * ... LIMIT 1` probe, as for file-backed tables.
+- A missing MongoDB collection raised the probe's `DatabaseError` from
+  `has_table()` and autoload. Absence is now proven, like missing files, by a
+  missing-object diagnostic plus a fresh, complete, unlimited and nonempty
+  `INFORMATION_SCHEMA.TABLES` listing of the database that lacks the name;
+  empty, limited or failed listings still preserve the original error.
+- An HTTPS login whose certificate fails verification now raises
+  `TransportError` explaining that certificates are verified by default since
+  1.1.11.4 and naming the fix (`verify_ssl=<path to the CA bundle>`), instead
+  of a bare SSL error. Verification is never disabled automatically.
+- Query-profile reads for guarded absence used a fixed 30 s timeout per
+  request (up to seven requests plus about 5 s of sleeps). The whole poll now
+  shares one budget: the connection's `request_timeout`, else 30 s.
+- The cancellation tag was per cursor, so `Cursor.cancel()` could reach a
+  different statement from the same cursor. Every `execute()` now uses a
+  fresh tag; `cancel()` only reaches the cursor's latest statement and returns
+  `False` before the first `execute()`.
+- `get_view_definition()` without a schema and without a database in the URL
+  bound `TABLE_SCHEMA = NULL` and never matched. It now searches all schemas
+  and requires a unique match (`InvalidRequestError` if the view name exists
+  in several schemas).
+- When `request_timeout` expires, the driver now cancels the timed-out
+  statement on the server (found by its tag) instead of leaving it running.
+
+### Added
+
+- `Cursor.cancel_group` (optional, 32 lowercase hex characters) marks every
+  statement the cursor runs with a shared ID in addition to its own tag, and
+  `Connection.cancel_query_group(id)` cancels whichever of them is running.
+  This suits callers that must choose a cancel ID before execution starts,
+  such as a SQL editor's "Stop" button, possibly from another connection.
+
 ## [1.1.11.4] - unreleased
+
+### Breaking change
+
+- **HTTPS connections now verify the server certificate by default.** With
+  `use_ssl=true` and no `verify_ssl`, 1.1.11.3 and earlier encrypted without
+  checking the certificate; 1.1.11.4 checks it against the system trust store.
+  A server with a self-signed or private-CA certificate that previously
+  connected now fails verification. Migrate by setting
+  `verify_ssl=<path to the CA bundle that signed the server certificate>` in
+  the connection URL (or the `connect()` argument). `verify_ssl=false` restores
+  the old unverified behaviour and is not recommended.
 
 ### Fixed
 
@@ -12,7 +62,8 @@
   the string, which requests reads as a CA bundle path, so `verify_ssl=true`
   failed with "Could not find a suitable TLS CA certificate bundle". Boolean
   spellings now become booleans; any other value is still a CA bundle path.
-  The default (no `verify_ssl`) is unchanged.
+  (Correction: an earlier version of this note said the default was
+  unchanged. It is not; see "Breaking change" below.)
 
 - A provably absent file-backed table could surface as the opaque
   `DatabaseError` instead of `False` / `NoSuchTableError` on a busy server:
@@ -146,7 +197,7 @@
   `verify_ssl` defaults to `False`, so `use_ssl=True` alone encrypts without
   authenticating the server. Pass `verify_ssl=True` for a trusted connection.
   This is long-standing behaviour and is unchanged here; changing the default
-  is a separate breaking change.
+  is a separate breaking change. (Superseded: 1.1.11.4 verifies by default.)
 - JDBC and ODBC still inherit `driver == "rest"` from the base dialect. That is
   wrong for both transports, but correcting public dialect metadata is a visible
   API change that deserves its own review rather than riding along with this
