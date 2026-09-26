@@ -13,18 +13,21 @@ Classes:
 """
 import logging
 import re
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timedelta
 from decimal import Decimal
 from itertools import chain, islice
 from json import dumps
 from math import isfinite
 from numbers import Integral, Real
-from time import gmtime
+from time import sleep
 from typing import List
+from urllib.parse import quote
 
 from ijson import parse
 from ijson.common import ObjectBuilder
 from requests import Session, Response
+from requests.exceptions import RequestException, Timeout
+from uuid import uuid4
 
 from . import api_globals
 from .api_exceptions import (
@@ -40,7 +43,19 @@ from .api_exceptions import (
     NotSupportedError,
     OperationalError,
     ProgrammingError,
+    TransportError,
 )
+
+def _transport_error(ex, what):
+    """Wrap a requests failure as a DB-API OperationalError subclass."""
+    return TransportError(f'Drill REST {what} failed: {type(ex).__name__}: {ex}', None)
+
+
+# Leading block comment added to every cursor statement. It identifies the
+# statement in Drill's running-query list, which is the only way to cancel a
+# REST query before Drill sends its query ID with the first result batch.
+_QUERY_TAG_PREFIX = 'sqlalchemy-drill:'
+
 
 # DB-API 2.0 requires Warning to be exported at module level
 # We renamed it to DrillWarning to avoid shadowing built-in, but alias it here
@@ -228,6 +243,9 @@ class Cursor:
         self.result_md = {}
 
         self._is_open: bool = True
+        # One tag per cursor, stable for its lifetime: every statement it
+        # executes carries it, so a caller can cancel whichever is running.
+        self.query_tag: str = uuid4().hex
         self._result_event_stream = self._row_stream = None
         self._typecaster_list: list = None
 
@@ -341,8 +359,11 @@ class Cursor:
     def getdesc(self):
         return self.description
 
-    @is_open
     def close(self):
+        # Not @is_open: SQLAlchemy closes cursors after invalidating their
+        # connection on a disconnect, and that must still release the stream.
+        if self._is_open is False:
+            return
         self._is_open = False
         if self._row_stream is not None:
             self._row_stream.close()
@@ -361,6 +382,7 @@ class Cursor:
 
         self.rowcount = -1
         self.rownumber = 0
+        self.result_md = {}
 
         matchObj = re.match(r'^SHOW FILES FROM\s(.+)',
                             operation, re.IGNORECASE)
@@ -372,7 +394,8 @@ class Cursor:
             )
 
         resp = self.connection.submit_query(
-            self.substitute_in_query(operation, parameters)
+            f'/* {_QUERY_TAG_PREFIX}{self.query_tag} */ '
+            + self.substitute_in_query(operation, parameters)
         )
 
         if resp.status_code != 200:
@@ -483,8 +506,22 @@ class Cursor:
     @is_open
     def get_query_id(self) -> str:
         """Unofficial convenience method for getting the Drill ID of the last query.
+
+        Drill's REST API sends the ID together with the first result batch,
+        so it is None until the query has started returning results.
         """
-        return self._query_id
+        return self.result_md.get('queryId')
+
+    def cancel(self):
+        """Ask Drill to cancel the statement this cursor is running.
+
+        Safe to call from another thread, including while execute() is still
+        waiting for the first result batch. The statement is found by this
+        cursor's tag in Drill's running-query list. Returns True iff Drill
+        reports that it cancelled a query; False if nothing tagged by this
+        cursor is running.
+        """
+        return self.connection.cancel_tagged_query(self.query_tag)
 
     @is_open
     def get_column_names(self) -> List:
@@ -517,7 +554,8 @@ class Connection:
                  proto: str,
                  impersonation_target: str,
                  session: Session,
-                 stream_results: bool = True):
+                 stream_results: bool = True,
+                 request_timeout: float = None):
         if session is None:
             raise ProgrammingError('A Requests session is required.', None)
 
@@ -526,6 +564,9 @@ class Connection:
         self._connected = True
         self._impersonation_target = impersonation_target
         self._stream_results = stream_results
+        # None (the default) keeps the historical behaviour: no client-side
+        # limit, so a stalled server blocks the caller indefinitely.
+        self._request_timeout = request_timeout
 
         logger.debug('queries Drill\'s version number...')
         resp = self.submit_query(
@@ -560,16 +601,27 @@ class Connection:
         logger.debug(f'sends an HTTP POST with payload (stream={stream})')
         logger.debug(payload)
 
-        resp = self._session.post(
-            f'{self._base_url}/query.json',
-            data=dumps(payload),
-            headers=api_globals._HEADER,
-            timeout=None,
-            stream=stream
-        )
+        try:
+            resp = self._session.post(
+                f'{self._base_url}/query.json',
+                data=dumps(payload),
+                headers=api_globals._HEADER,
+                timeout=self._request_timeout,
+                stream=stream
+            )
+        except Timeout as ex:
+            raise TransportError(
+                f'Drill REST request timed out after {self._request_timeout} s',
+                None
+            ) from ex
+        except RequestException as ex:
+            raise _transport_error(ex, 'query request') from ex
 
-        logger.debug('received an HTTP response with body:')
-        logger.debug(resp.text)
+        # Never touch resp.text for a streamed response: evaluating it reads
+        # the whole body into memory, which silently defeats stream_results.
+        if not stream and logger.isEnabledFor(logging.DEBUG):
+            logger.debug('received an HTTP response with body:')
+            logger.debug(resp.text)
 
         if resp.status_code == 200:
             return resp
@@ -605,6 +657,73 @@ class Connection:
             raise ConnectionClosedException('Failed to close connection') from ex
 
     @connected
+    def cancel_query(self, query_id: str) -> bool:
+        """Cancel a running query by ID with Drill's REST cancel endpoint.
+
+        Returns True iff Drill reports that it cancelled the query; False if
+        the query is no longer running or Drill could not locate it.
+        """
+        try:
+            resp = self._session.get(
+                f'{self._base_url}/profiles/cancel/{quote(query_id, safe="")}',
+                timeout=self._request_timeout or 30,
+            )
+        except Timeout as ex:
+            raise TransportError(
+                f'Drill REST cancel request timed out for query {query_id}', None
+            ) from ex
+        except RequestException as ex:
+            raise _transport_error(ex, 'cancel request') from ex
+        if resp.status_code != 200:
+            raise OperationalError(
+                f'Drill REST cancel request failed for query {query_id}',
+                resp.status_code
+            )
+        message = resp.text
+        logger.info(f'cancel request for {query_id}: {message}')
+        return (message.startswith('Cancelled query ')
+                or (' canceled on node ' in message
+                    and message.startswith('Query ')))
+
+    @connected
+    def find_tagged_query(self, query_tag: str, attempts: int = 3):
+        """Return the ID of the running query carrying query_tag, or None.
+
+        Retries briefly because Drill registers a query as running shortly
+        after accepting it. Only an exact, unique tag match is returned.
+        """
+        marker = f'/* {_QUERY_TAG_PREFIX}{query_tag} */'
+        for attempt in range(attempts):
+            if attempt:
+                sleep(0.2)
+            try:
+                resp = self._session.get(
+                    f'{self._base_url}/profiles/running.json',
+                    timeout=self._request_timeout or 30,
+                )
+            except RequestException as ex:
+                raise _transport_error(ex, 'running-query lookup') from ex
+            if resp.status_code != 200:
+                raise OperationalError(
+                    'Drill REST running-query lookup failed', resp.status_code)
+            matches = [
+                entry.get('queryId') for entry in resp.json().get('runningQueries', [])
+                if marker in (entry.get('query') or '')
+            ]
+            if len(matches) == 1 and matches[0]:
+                return matches[0]
+            if len(matches) > 1:
+                raise OperationalError(
+                    f'{len(matches)} running queries carry tag {query_tag}', None)
+        return None
+
+    @connected
+    def cancel_tagged_query(self, query_tag: str) -> bool:
+        """Cancel the running query carrying query_tag (see Cursor.query_tag)."""
+        query_id = self.find_tagged_query(query_tag)
+        return bool(query_id) and self.cancel_query(query_id)
+
+    @connected
     def commit(self):
         logger.debug('commit is a no-op in this driver.')
 
@@ -621,9 +740,10 @@ def connect(host: str,
             use_ssl: bool = False,
             drilluser: str = None,
             drillpass: str = None,
-            verify_ssl: bool = False,
+            verify_ssl=True,
             impersonation_target: str = None,
-            stream_results: bool = True
+            stream_results: bool = True,
+            request_timeout: float = None
             ) -> Connection:
     """
     Establishes a connection with an Apache Drill server.
@@ -641,10 +761,15 @@ def connect(host: str,
     use_ssl (bool, optional): Flag indicating whether to use SSL/TLS for the connection. Defaults to False.
     drilluser (str, optional): The username to authenticate with. If not provided, it uses anonymous authentication.
     drillpass (str, optional): The password for the given username. Required if `drilluser` is provided.
-    verify_ssl (bool, optional): Whether to verify the SSL certificates for secure connections. Defaults to False.
+    verify_ssl (bool or str, optional): Verify the server certificate for HTTPS connections: True uses the system
+                                        trust store, a string is a CA bundle path, False disables verification.
+                                        Defaults to True.
     impersonation_target (str, optional): The impersonation target to use for the connection. If provided, operations
                                            will be performed as the specified user.
     stream_results (bool, optional): Flag to enable or disable streaming of query results. Defaults to True.
+    request_timeout (float, optional): Seconds to wait for Drill to accept a connection or send the next response
+                                       bytes on every REST request. A timeout raises OperationalError. Defaults to
+                                       None: no limit, the historical behaviour.
 
     Returns:
     Connection: An object representing the established connection to the Apache Drill server.
@@ -653,8 +778,20 @@ def connect(host: str,
     DatabaseError: If the connection to the Apache Drill server could not be established or an error occurs with the server.
     AuthError: If authentication fails due to invalid username or password.
     """
+    if request_timeout is not None:
+        try:
+            request_timeout = float(request_timeout)
+        except (TypeError, ValueError):
+            request_timeout = float('nan')
+        if not isfinite(request_timeout) or request_timeout <= 0:
+            raise ProgrammingError(
+                'request_timeout must be a positive number of seconds', None)
     session = Session()
 
+    if verify_ssl is None:
+        verify_ssl = True
+    if verify_ssl is False and use_ssl in [True, 'True', 'true']:
+        logger.warning('TLS certificate verification is disabled (verify_ssl=False).')
     session.verify = verify_ssl
     proto = 'https://' if use_ssl in [True, 'True', 'true'] else 'http://'
     base_url = f'{proto}{host}:{port}'
@@ -669,19 +806,21 @@ def connect(host: str,
         payload['userName'] = impersonation_target
 
         payload['query'] = 'show schemas'
-        response = session.post(
-            f'{base_url}/query.json',
-            data=dumps(payload),
-            headers=api_globals._HEADER
-        )
+        login = dict(url=f'{base_url}/query.json', data=dumps(payload),
+                     headers=api_globals._HEADER)
     else:
         payload = api_globals._LOGIN.copy()
         payload['j_username'] = drilluser
         payload['j_password'] = drillpass
-        response = session.post(
-            f'{base_url}/j_security_check',
-            data=payload
-        )
+        login = dict(url=f'{base_url}/j_security_check', data=payload)
+    try:
+        response = session.post(timeout=request_timeout, **login)
+    except Timeout as ex:
+        raise TransportError(
+            f'Drill REST request timed out after {request_timeout} s', None
+        ) from ex
+    except RequestException as ex:
+        raise _transport_error(ex, 'login request') from ex
 
     if response.status_code != 200:
         logger.error('was unable to connect to Drill.')
@@ -695,7 +834,8 @@ def connect(host: str,
         logger.error('failed to authenticate to Drill.')
         raise AuthError(str(raw_data), response.status_code)
 
-    conn = Connection(host, port, proto, impersonation_target, session, stream_results)
+    conn = Connection(host, port, proto, impersonation_target, session,
+                      stream_results, request_timeout)
     if db is not None:
         conn.submit_query(f'USE {db}')
 
@@ -704,15 +844,33 @@ def connect(host: str,
 
 class RequestsStreamWrapper:
     """
-    A wrapper around a Requests response payload for converting
-    the returned generator into a file-like object.
+    A file-like view of a streamed Requests response for ijson.
+
+    Reads the body in 64 KiB chunks (the previous implementation consumed
+    it one byte at a time) and turns transport failures during streaming
+    into DB-API TransportError.
     """
 
-    def __init__(self, resp: Response):
-        self.data = chain.from_iterable(resp.iter_content())
+    _CHUNK = 65536
 
-    def read(self, n):
-        return bytes(islice(self.data, None, n))
+    def __init__(self, resp: Response):
+        self._chunks = resp.iter_content(chunk_size=self._CHUNK)
+        self._buffer = bytearray()
+
+    def read(self, n=-1):
+        try:
+            while n < 0 or len(self._buffer) < n:
+                chunk = next(self._chunks, None)
+                if chunk is None:
+                    break
+                self._buffer += chunk
+        except RequestException as ex:
+            raise _transport_error(ex, 'result stream') from ex
+        if n < 0:
+            n = len(self._buffer)
+        data = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return data
 
 
 def _items_once(event_stream, prefix):
@@ -816,19 +974,32 @@ def Timestamp(year, month, day, hour=0, minute=0, second=0, microsecond=0,
                     tzinfo)
 
 
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _datetime_from_epoch_ms(ticks):
+    # Drill >= 1.19 REST returns DATE, TIME and TIMESTAMP as UTC epoch
+    # milliseconds (TIME as milliseconds since midnight). Zero is a real value
+    # (1970-01-01, 00:00:00), so only None means NULL. timedelta keeps the
+    # millisecond fraction that time.gmtime() would truncate.
+    return None if ticks is None else _EPOCH + timedelta(milliseconds=ticks)
+
+
 def DateFromTicks(ticks):
     """Construct an object holding a date value from the given Unix time ms."""
-    return Date(*gmtime(ticks/1000)[:3]) if ticks else None
+    value = _datetime_from_epoch_ms(ticks)
+    return None if value is None else value.date()
 
 
 def TimeFromTicks(ticks):
     """Construct an object holding a time value from the given Unix time ms."""
-    return Time(*gmtime(ticks/1000)[3:6]) if ticks else None
+    value = _datetime_from_epoch_ms(ticks)
+    return None if value is None else value.time()
 
 
 def TimestampFromTicks(ticks):
     """Construct an object holding a timestamp from the given Unix time ms."""
-    return Timestamp(*gmtime(ticks/1000)[:6]) if ticks else None
+    return _datetime_from_epoch_ms(ticks)
 
 
 class Binary(bytes):

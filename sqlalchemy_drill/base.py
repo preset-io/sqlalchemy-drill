@@ -37,6 +37,9 @@ from sqlalchemy_drill.drilldbapi.api_exceptions import DatabaseError
 
 logger = logging.getLogger('drilldbapi')
 
+# Delays (seconds) before each query-profile read while its error is unpublished.
+_PROFILE_RETRY_DELAYS = (0, 0.1, 0.2, 0.4, 0.8, 1.6, 2.0)
+
 
 _type_map = {
     'bit': types.BOOLEAN,
@@ -421,6 +424,30 @@ class DrillDialect(default.DefaultDialect):
         return tuple(row[0] for row in curs)
 
     @reflection.cache
+    def get_view_definition(self, connection, view_name, schema=None, **kw):
+        """Return the stored SQL of a Drill view.
+
+        Drill publishes view SQL in INFORMATION_SCHEMA.VIEWS. Both names are
+        bound literals, and the result is fully consumed so a trailing REST
+        failure is raised rather than read as a missing view.
+        """
+        schema = self._schema_name(connection, schema)
+        rows = connection.execute(
+            text(
+                "SELECT `VIEW_DEFINITION` "
+                "FROM INFORMATION_SCHEMA.`VIEWS` "
+                "WHERE `TABLE_SCHEMA` = :schema "
+                "AND `TABLE_NAME` = :view_name"
+            ),
+            {"schema": schema, "view_name": view_name},
+        ).fetchall()
+        if not rows:
+            raise exc.NoSuchTableError(
+                f"{schema + '.' if schema else ''}{view_name}"
+            )
+        return rows[0][0]
+
+    @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kwargs):
         """Return whether Drill exposes the table.
 
@@ -512,10 +539,14 @@ class DrillDialect(default.DefaultDialect):
         # Reuse the query's authenticated session and TLS settings, not a
         # new requests session. This is only reached for failed REST probes.
         # Drill publishes the final profile after returning query results.
-        # An immediate GET can see the still-active profile without error.
-        # Retry that incomplete profile briefly, but never infer absence
-        # from a profile that remains unknown or cannot be fetched.
-        for delay in (0, 0.1, 0.2):
+        # An immediate GET can see the still-active profile without error;
+        # on a busy server that window exceeded 0.3 s, and a provably absent
+        # table then surfaced as the opaque DatabaseError. The opaque REST
+        # text itself is identical for permission and other failures, so it
+        # is never evidence. Poll the profile with backoff (about 5 s in
+        # total) and never infer absence from a profile that remains unknown
+        # or cannot be fetched.
+        for delay in _PROFILE_RETRY_DELAYS:
             if delay:
                 sleep(delay)
             try:

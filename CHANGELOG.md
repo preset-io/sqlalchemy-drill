@@ -1,3 +1,60 @@
+## [1.1.11.4] - unreleased
+
+### Fixed
+
+- REST DATE, TIME and TIMESTAMP values equal to zero epoch milliseconds
+  (1970-01-01, midnight, 1970-01-01 00:00:00) were returned as `None`. Only a
+  JSON null now decodes to `None`.
+- REST TIME and TIMESTAMP values keep their millisecond fraction instead of
+  being truncated to whole seconds.
+
+- A `verify_ssl=true` / `verify_ssl=false` URL value was passed to requests as
+  the string, which requests reads as a CA bundle path, so `verify_ssl=true`
+  failed with "Could not find a suitable TLS CA certificate bundle". Boolean
+  spellings now become booleans; any other value is still a CA bundle path.
+  The default (no `verify_ssl`) is unchanged.
+
+- A provably absent file-backed table could surface as the opaque
+  `DatabaseError` instead of `False` / `NoSuchTableError` on a busy server:
+  the failed query's profile was read for only about 0.3 s before its error
+  was published. The profile is now polled with backoff for about 5 s. The
+  opaque REST error text is still never treated as evidence, because
+  permission and other failures produce the same text.
+- `Cursor.get_query_id()` raised `AttributeError`; it now returns the query
+  ID once Drill has sent it, else `None`.
+
+- TLS certificates are now verified by default when `use_ssl` is set
+  (system trust store). `verify_ssl=<CA bundle path>` selects a CA bundle and
+  `verify_ssl=false` explicitly disables verification (logged as a warning).
+  Previously an HTTPS connection without `verify_ssl` accepted any certificate.
+- A streamed query no longer reads its whole response body into memory:
+  a debug log statement evaluated `Response.text` for every query, so
+  `stream_results` had no effect and memory grew with the result size. The
+  body is also parsed in 64 KiB chunks instead of one byte at a time.
+- REST transport failures (connection errors, resets, timeouts, including
+  mid-stream) raise DB-API `TransportError` (an `OperationalError`) instead of
+  raw `requests` exceptions, and the dialect reports them and closed
+  connections as disconnects. `pool_pre_ping` and SQLAlchemy invalidation now
+  replace a pooled connection whose HTTP session failed or was closed, instead
+  of handing it out and failing the first statement.
+- `Cursor.close()` works after its connection was closed or invalidated.
+
+### Added
+
+- Opt-in `request_timeout=<seconds>` connection option (URL query parameter)
+  applied to every REST request; a timeout raises `OperationalError`. Without
+  it nothing changes: there is no client-side limit, as before.
+- `Cursor.cancel()` cancels the statement the cursor is running, including
+  before Drill has sent any result (for example a long aggregation). Every
+  cursor statement carries a leading `/* sqlalchemy-drill:<tag> */` comment
+  with a per-cursor tag (`Cursor.query_tag`); `cancel()` finds that unique tag
+  in Drill's running-query list and calls `/profiles/cancel/{queryId}`.
+  `Connection.cancel_query(query_id)` and `Connection.cancel_tagged_query(tag)`
+  are also available, e.g. to cancel from another connection.
+- `get_view_definition()` returns the stored view SQL from
+  `INFORMATION_SCHEMA.VIEWS` (bound schema and view name) instead of raising
+  `NotImplementedError`; an unknown view raises `NoSuchTableError`.
+
 ## [1.1.11.3] - unreleased
 
 ### Fixed
