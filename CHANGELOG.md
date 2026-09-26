@@ -8,6 +8,12 @@
 - REST TIME and TIMESTAMP values keep their millisecond fraction instead of
   being truncated to whole seconds.
 
+- A `verify_ssl=true` / `verify_ssl=false` URL value was passed to requests as
+  the string, which requests reads as a CA bundle path, so `verify_ssl=true`
+  failed with "Could not find a suitable TLS CA certificate bundle". Boolean
+  spellings now become booleans; any other value is still a CA bundle path.
+  The default (no `verify_ssl`) is unchanged.
+
 ### Added
 
 - `get_view_definition()` returns the stored view SQL from

@@ -1165,3 +1165,26 @@ def test_view_definition_reads_bound_information_schema(fake_engine):
     assert parameters == ("jdbc.prod", "account_view")
     with pytest.raises(sa_exc.NoSuchTableError):
         inspector.get_view_definition("no_such_view", "jdbc.prod")
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("True", True), ("1", True),
+    ("false", False), ("False", False), ("0", False),
+    ("/etc/ssl/certs/ca.pem", "/etc/ssl/certs/ca.pem"),
+])
+def test_rest_verify_ssl_url_value_is_a_flag_or_a_ca_bundle_path(value, expected):
+    # requests reads every string verify value as a CA bundle path, so the
+    # natural verify_ssl=true URL spelling must reach it as a boolean.
+    from sqlalchemy.engine import make_url
+
+    _args, kwargs = DrillDialect_sadrill().create_connect_args(
+        make_url(f"drill+sadrill://h:8047/dfs/tmp?use_ssl=true&verify_ssl={value}"))
+    assert kwargs["verify_ssl"] == expected and type(kwargs["verify_ssl"]) is type(expected)
+
+
+def test_rest_verify_ssl_is_absent_unless_configured():
+    from sqlalchemy.engine import make_url
+
+    _args, kwargs = DrillDialect_sadrill().create_connect_args(
+        make_url("drill+sadrill://h:8047/dfs/tmp?use_ssl=true"))
+    assert "verify_ssl" not in kwargs
