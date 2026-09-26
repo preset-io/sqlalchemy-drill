@@ -13,13 +13,12 @@ Classes:
 """
 import logging
 import re
-from datetime import date, time, datetime
+from datetime import date, time, datetime, timedelta
 from decimal import Decimal
 from itertools import chain, islice
 from json import dumps
 from math import isfinite
 from numbers import Integral, Real
-from time import gmtime
 from typing import List
 
 from ijson import parse
@@ -816,19 +815,32 @@ def Timestamp(year, month, day, hour=0, minute=0, second=0, microsecond=0,
                     tzinfo)
 
 
+_EPOCH = datetime(1970, 1, 1)
+
+
+def _datetime_from_epoch_ms(ticks):
+    # Drill >= 1.19 REST returns DATE, TIME and TIMESTAMP as UTC epoch
+    # milliseconds (TIME as milliseconds since midnight). Zero is a real value
+    # (1970-01-01, 00:00:00), so only None means NULL. timedelta keeps the
+    # millisecond fraction that time.gmtime() would truncate.
+    return None if ticks is None else _EPOCH + timedelta(milliseconds=ticks)
+
+
 def DateFromTicks(ticks):
     """Construct an object holding a date value from the given Unix time ms."""
-    return Date(*gmtime(ticks/1000)[:3]) if ticks else None
+    value = _datetime_from_epoch_ms(ticks)
+    return None if value is None else value.date()
 
 
 def TimeFromTicks(ticks):
     """Construct an object holding a time value from the given Unix time ms."""
-    return Time(*gmtime(ticks/1000)[3:6]) if ticks else None
+    value = _datetime_from_epoch_ms(ticks)
+    return None if value is None else value.time()
 
 
 def TimestampFromTicks(ticks):
     """Construct an object holding a timestamp from the given Unix time ms."""
-    return Timestamp(*gmtime(ticks/1000)[:6]) if ticks else None
+    return _datetime_from_epoch_ms(ticks)
 
 
 class Binary(bytes):

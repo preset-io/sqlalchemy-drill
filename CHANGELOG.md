@@ -1,3 +1,13 @@
+## [1.1.11.4] - unreleased
+
+### Fixed
+
+- REST DATE, TIME and TIMESTAMP values equal to zero epoch milliseconds
+  (1970-01-01, midnight, 1970-01-01 00:00:00) were returned as `None`. Only a
+  JSON null now decodes to `None`.
+- REST TIME and TIMESTAMP values keep their millisecond fraction instead of
+  being truncated to whole seconds.
+
 ## [1.1.11.3] - unreleased
 
 ### Fixed

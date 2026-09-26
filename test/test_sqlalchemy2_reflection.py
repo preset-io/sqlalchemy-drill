@@ -1121,3 +1121,27 @@ def test_success_and_ordinary_query_errors_never_fetch_profiles(
     state.query_state = "COMPLETED"
     assert _reflect(engine, "has_table") is True
     assert state.profile_calls == []
+
+
+@pytest.mark.parametrize("column_type,ticks,expected", [
+    ("TIMESTAMP", 0, datetime.datetime(1970, 1, 1)),
+    ("DATE", 0, datetime.date(1970, 1, 1)),
+    ("TIME", 0, datetime.time(0, 0)),
+    ("TIMESTAMP", 1790426096789,
+     datetime.datetime(2026, 9, 26, 12, 34, 56, 789000)),
+    ("TIME", 45296789, datetime.time(12, 34, 56, 789000)),
+    ("TIMESTAMP", -1000, datetime.datetime(1969, 12, 31, 23, 59, 59)),
+    ("DATE", -2208988800000, datetime.date(1900, 1, 1)),
+    ("TIMESTAMP", None, None),
+    ("DATE", None, None),
+    ("TIME", None, None),
+])
+def test_rest_temporal_values_keep_zero_and_milliseconds(column_type, ticks, expected):
+    # Drill >= 1.19 REST sends temporal values as epoch milliseconds. Zero is
+    # midnight / the epoch, not NULL, and the millisecond fraction is data.
+    from sqlalchemy_drill.drilldbapi import _drilldbapi
+
+    decode = {"DATE": _drilldbapi.DateFromTicks, "TIME": _drilldbapi.TimeFromTicks,
+              "TIMESTAMP": _drilldbapi.TimestampFromTicks}[column_type]
+    got = decode(ticks)
+    assert got == expected and type(got) is type(expected)
