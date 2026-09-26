@@ -421,6 +421,30 @@ class DrillDialect(default.DefaultDialect):
         return tuple(row[0] for row in curs)
 
     @reflection.cache
+    def get_view_definition(self, connection, view_name, schema=None, **kw):
+        """Return the stored SQL of a Drill view.
+
+        Drill publishes view SQL in INFORMATION_SCHEMA.VIEWS. Both names are
+        bound literals, and the result is fully consumed so a trailing REST
+        failure is raised rather than read as a missing view.
+        """
+        schema = self._schema_name(connection, schema)
+        rows = connection.execute(
+            text(
+                "SELECT `VIEW_DEFINITION` "
+                "FROM INFORMATION_SCHEMA.`VIEWS` "
+                "WHERE `TABLE_SCHEMA` = :schema "
+                "AND `TABLE_NAME` = :view_name"
+            ),
+            {"schema": schema, "view_name": view_name},
+        ).fetchall()
+        if not rows:
+            raise exc.NoSuchTableError(
+                f"{schema + '.' if schema else ''}{view_name}"
+            )
+        return rows[0][0]
+
+    @reflection.cache
     def has_table(self, connection, table_name, schema=None, **kwargs):
         """Return whether Drill exposes the table.
 

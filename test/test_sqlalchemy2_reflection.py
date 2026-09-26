@@ -73,6 +73,10 @@ class FakeCursor:
                 (table,) for candidate_schema, table in state.tables
                 if candidate_schema == schema
             ]
+        elif "SELECT `VIEW_DEFINITION` FROM INFORMATION_SCHEMA.`VIEWS`" in normalized:
+            self.description = self._description("VIEW_DEFINITION")
+            self._rows = ([(state.view_sql[parameters],)]
+                          if parameters in state.view_sql else [])
         elif "FROM INFORMATION_SCHEMA.`VIEWS`" in normalized:
             self.description = self._description("TABLE_NAME")
             schema = parameters[0]
@@ -168,6 +172,9 @@ class FakeState:
         self.views = {
             ("dfs.tmp", "saved_view"),
             ("jdbc.prod", "account_view"),
+        }
+        self.view_sql = {
+            ("jdbc.prod", "account_view"): "SELECT `id`\nFROM `jdbc`.`prod`.`accounts`",
         }
         self.columns = {
             ("jdbc.prod", "accounts"): [
@@ -1145,3 +1152,16 @@ def test_rest_temporal_values_keep_zero_and_milliseconds(column_type, ticks, exp
               "TIMESTAMP": _drilldbapi.TimestampFromTicks}[column_type]
     got = decode(ticks)
     assert got == expected and type(got) is type(expected)
+
+
+def test_view_definition_reads_bound_information_schema(fake_engine):
+    engine, state = fake_engine
+    inspector = sqlalchemy.inspect(engine)
+    assert inspector.get_view_definition("account_view", "jdbc.prod") == (
+        "SELECT `id`\nFROM `jdbc`.`prod`.`accounts`"
+    )
+    statement, parameters = state.calls[-1]
+    assert "account_view" not in statement and "jdbc.prod" not in statement
+    assert parameters == ("jdbc.prod", "account_view")
+    with pytest.raises(sa_exc.NoSuchTableError):
+        inspector.get_view_definition("no_such_view", "jdbc.prod")

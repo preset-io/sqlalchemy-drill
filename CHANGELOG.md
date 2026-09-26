@@ -8,6 +8,12 @@
 - REST TIME and TIMESTAMP values keep their millisecond fraction instead of
   being truncated to whole seconds.
 
+### Added
+
+- `get_view_definition()` returns the stored view SQL from
+  `INFORMATION_SCHEMA.VIEWS` (bound schema and view name) instead of raising
+  `NotImplementedError`; an unknown view raises `NoSuchTableError`.
+
 ## [1.1.11.3] - unreleased
 
 ### Fixed
