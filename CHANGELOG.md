@@ -1,3 +1,17 @@
+## [1.1.11.5] - unreleased
+
+### Fixed
+
+- Reflection of dynamic-schema plugins such as Kafka returned only the
+  `**` placeholder column that INFORMATION_SCHEMA publishes for them. When
+  that placeholder is the only column, the real columns are now read from a
+  `SELECT * ... LIMIT 1` probe, as for file-backed tables.
+- A missing MongoDB collection raised the probe's `DatabaseError` from
+  `has_table()` and autoload. Absence is now proven, like missing files, by a
+  missing-object diagnostic plus a fresh, complete, unlimited and nonempty
+  `INFORMATION_SCHEMA.TABLES` listing of the database that lacks the name;
+  empty, limited or failed listings still preserve the original error.
+
 ## [1.1.11.4] - unreleased
 
 ### Fixed

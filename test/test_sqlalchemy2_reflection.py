@@ -165,6 +165,7 @@ class FakeState:
             "dfs.tmp": "file",
             "jdbc.prod": "jdbc",
             "mongo.analytics": "mongo",
+            "kafka": "kafka",
         }
         self.tables = {
             ("jdbc.prod", "accounts"),
@@ -178,6 +179,7 @@ class FakeState:
             ("jdbc.prod", "account_view"): "SELECT `id`\nFROM `jdbc`.`prod`.`accounts`",
         }
         self.columns = {
+            ("kafka", "orders_topic"): [("**", "ANY", "YES")],
             ("jdbc.prod", "accounts"): [
                 ("id", "INTEGER", "NO"),
                 ("display_name", "VARCHAR", "YES"),
@@ -768,6 +770,7 @@ def streaming_rest_engine(monkeypatch):
         listings={"": [{"name": "sibling.json", "isDirectory": False,
                          "isFile": True}]}, listing_state="COMPLETED",
         listing_limit=0, listing_error=None, plugin_type="file", max_rows="0",
+        table_listing=["other_collection"],
     )
 
     def post(_url, *, data, **_kwargs):
@@ -796,6 +799,10 @@ def streaming_rest_engine(monkeypatch):
             metadata = ["VARCHAR", "BIT", "BIT"]
             directory = query.removeprefix('SHOW FILES FROM cp.`default`')
             rows = state.listings.get(directory, [])
+            query_state = state.listing_state
+        elif "SELECT `TABLE_NAME` FROM INFORMATION_SCHEMA.`TABLES`" in query:
+            columns, metadata = ["TABLE_NAME"], ["VARCHAR"]
+            rows = [{"TABLE_NAME": name} for name in state.table_listing]
             query_state = state.listing_state
         elif "INFORMATION_SCHEMA.`VIEWS`" in query:
             rows = []
@@ -1130,7 +1137,9 @@ def test_unproven_absence_preserves_original_error(streaming_rest_engine, verbos
     elif problem == "server_limit":
         state.max_rows = "1"
     elif problem == "mongo":
+        # An empty collection listing cannot prove absence.
         state.plugin_type = "mongo"
+        state.table_listing = []
     elif problem == "unknown_schema":
         state.plugin_type = None
     with pytest.raises(sa_exc.DatabaseError) as caught:
@@ -1542,3 +1551,46 @@ def test_streamed_query_body_is_not_read_into_memory():
     cursor.execute("SELECT v FROM t")
     assert cursor.fetchall() == [(1,), (2,)]
     assert touched == []
+
+
+def test_dynamic_schema_plugin_reflects_real_columns_not_the_placeholder(fake_engine):
+    # Kafka (and other dynamic-schema plugins) list a single `**` column in
+    # INFORMATION_SCHEMA; the real columns come from a LIMIT 1 probe.
+    engine, state = fake_engine
+    with engine.connect() as connection:
+        columns = connection.dialect.get_columns(connection, "orders_topic", "kafka")
+    assert [column["name"] for column in columns] == ["id", "payload"]
+    assert any(statement == "SELECT * FROM kafka.orders_topic LIMIT 1"
+               for statement, _ in state.calls)
+
+
+@pytest.mark.parametrize("operation", ["has_table", "get_columns", "autoload"])
+@pytest.mark.parametrize("verbose", [False, True])
+def test_missing_mongo_collection_is_proven_absent_from_a_complete_listing(
+        streaming_rest_engine, verbose, operation):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT, verbose)
+    state.plugin_type = "mongo"
+    if operation == "has_table":
+        assert _reflect(engine, operation) is False
+    else:
+        with pytest.raises(sa_exc.NoSuchTableError):
+            _reflect(engine, operation)
+
+
+@pytest.mark.parametrize("problem", ["empty", "listed", "failed", "server_limit"])
+def test_unprovable_mongo_absence_keeps_the_original_error(streaming_rest_engine, problem):
+    engine, state = streaming_rest_engine
+    _failed_reflection(state, _MISSING_OBJECT)
+    state.plugin_type = "mongo"
+    if problem == "empty":
+        state.table_listing = []
+    elif problem == "listed":
+        state.table_listing = ["resource.json"]
+    elif problem == "failed":
+        state.listing_state = "FAILED"
+    else:
+        state.max_rows = "1"
+    with pytest.raises(sa_exc.DatabaseError) as caught:
+        _reflect(engine, "get_columns")
+    assert not isinstance(caught.value, sa_exc.NoSuchTableError)

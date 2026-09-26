@@ -649,59 +649,7 @@ class DrillDialect(default.DefaultDialect):
 
         # Plugins with dynamic schemas use ** notation - query data directly
         if plugin_type in ('file', 'mongo', 'splunk', None):
-            quoted_file_name = self.identifier_preparer.format_drill_table(
-                schema, table_name)
-
-            # MongoDB uses ** notation - query data directly to get schema.
-            # Views and plain files are both read with SELECT *, so no
-            # get_view_names() round trip is needed to choose between them.
-            if plugin_type == "mongo":
-                q = f"SELECT `**` FROM {quoted_file_name} LIMIT 1"
-            else:
-                q = f"SELECT * FROM {quoted_file_name} LIMIT 1"
-
-            # This SQL contains identifiers, not literal values.  Using
-            # exec_driver_sql avoids text() treating a colon inside a quoted
-            # identifier as a bind marker.
-            try:
-                curs = connection.exec_driver_sql(q)
-                try:
-                    column_metadata = curs.cursor.description
-                    # Metadata precedes rows and final queryState in REST results.
-                    # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
-                    # DBAPI errors are wrapped, and never cache failed reflection.
-                    curs.fetchall()
-                finally:
-                    curs.close()
-            except exc.DBAPIError as error:
-                if (self._is_missing_object(error)
-                        and plugin_type == "file"
-                        and self._proves_file_absent(connection, schema, table_name)):
-                    raise exc.NoSuchTableError(
-                        f"{schema + '.' if schema else ''}{table_name}"
-                    ) from error
-                raise
-
-            for row in column_metadata:
-                # row[1] is a DBAPITypeObject - extract the type name from its values
-                type_obj = row[1]
-                if hasattr(type_obj, 'values') and type_obj.values:
-                    data_type = type_obj.values[0].lower()
-                else:
-                    data_type = str(type_obj).lower()
-                # Strip precision info like varchar(100) or decimal(10, 2)
-                if '(' in data_type:
-                    data_type = data_type.split('(')[0]
-                logger.debug(f"Getting data type: {data_type}")
-                drill_data_type = self.get_data_type(data_type)
-                column = {
-                    "name": row[0],
-                    "type": drill_data_type,
-                    "longtype": drill_data_type
-                }
-                result.append(column)
-            logger.debug(f"GET COLUMN QUERY RESULTS: {result}")
-            return result
+            return self._probe_columns(connection, schema, table_name, plugin_type)
 
         # INFORMATION_SCHEMA values are literals, so both schema and table are
         # bound.  In particular, table_name is never accepted as an arbitrary
@@ -731,8 +679,113 @@ class DrillDialect(default.DefaultDialect):
             raise exc.NoSuchTableError(
                 f"{schema + '.' if schema else ''}{table_name}"
             )
+        # Dynamic-schema plugins (e.g. Kafka) publish a single `**` column in
+        # INFORMATION_SCHEMA. That is a placeholder, not the table's columns:
+        # read the real ones from a LIMIT 1 probe instead.
+        if [column["name"] for column in result] == ["**"]:
+            return self._probe_columns(connection, schema, table_name, plugin_type)
         logger.debug(f"Result: {result}")
         return result
+
+    def _probe_columns(self, connection, schema, table_name, plugin_type):
+        """Reflect columns from the metadata of a LIMIT 1 probe query."""
+        result = []
+        quoted_file_name = self.identifier_preparer.format_drill_table(
+            schema, table_name)
+
+        # MongoDB uses ** notation - query data directly to get schema.
+        # Views and plain files are both read with SELECT *, so no
+        # get_view_names() round trip is needed to choose between them.
+        if plugin_type == "mongo":
+            q = f"SELECT `**` FROM {quoted_file_name} LIMIT 1"
+        else:
+            q = f"SELECT * FROM {quoted_file_name} LIMIT 1"
+
+        # This SQL contains identifiers, not literal values.  Using
+        # exec_driver_sql avoids text() treating a colon inside a quoted
+        # identifier as a bind marker.
+        try:
+            curs = connection.exec_driver_sql(q)
+            try:
+                column_metadata = curs.cursor.description
+                # Metadata precedes rows and final queryState in REST results.
+                # Exhaust this LIMIT 1 probe through SQLAlchemy so trailing
+                # DBAPI errors are wrapped, and never cache failed reflection.
+                curs.fetchall()
+            finally:
+                curs.close()
+        except exc.DBAPIError as error:
+            if self._is_missing_object(error) and (
+                    (plugin_type == "file"
+                     and self._proves_file_absent(connection, schema, table_name))
+                    or (plugin_type == "mongo"
+                        and self._proves_listed_absent(connection, schema, table_name))):
+                raise exc.NoSuchTableError(
+                    f"{schema + '.' if schema else ''}{table_name}"
+                ) from error
+            raise
+
+        for row in column_metadata:
+            # row[1] is a DBAPITypeObject - extract the type name from its values
+            type_obj = row[1]
+            if hasattr(type_obj, 'values') and type_obj.values:
+                data_type = type_obj.values[0].lower()
+            else:
+                data_type = str(type_obj).lower()
+            # Strip precision info like varchar(100) or decimal(10, 2)
+            if '(' in data_type:
+                data_type = data_type.split('(')[0]
+            logger.debug(f"Getting data type: {data_type}")
+            drill_data_type = self.get_data_type(data_type)
+            column = {
+                "name": row[0],
+                "type": drill_data_type,
+                "longtype": drill_data_type
+            }
+            result.append(column)
+        logger.debug(f"GET COLUMN QUERY RESULTS: {result}")
+        return result
+
+    def _proves_listed_absent(self, connection, schema, table_name):
+        """Corroborate a missing MongoDB collection from a complete listing.
+
+        Drill lists a database's collections in INFORMATION_SCHEMA.TABLES.
+        As for files, only a fresh, complete (unlimited, COMPLETED), nonempty
+        listing that lacks the name proves absence; a nonempty listing also
+        witnesses that the database is readable. Anything else is unprovable.
+        """
+        if not schema or not isinstance(table_name, str):
+            return False
+        try:
+            limits = connection.execute(text(
+                "SELECT val FROM sys.options WHERE name = 'exec.query.max_rows'"
+            ))
+            try:
+                limit_rows = limits.fetchall()
+            finally:
+                limits.close()
+            if len(limit_rows) != 1 or str(limit_rows[0][0]) != "0":
+                return False
+            listing = connection.execute(
+                text(
+                    "SELECT `TABLE_NAME` FROM INFORMATION_SCHEMA.`TABLES` "
+                    "WHERE `TABLE_SCHEMA` = :schema"
+                ),
+                {"schema": schema},
+            )
+            try:
+                cursor = listing.cursor
+                names = [row[0] for row in listing.fetchall()]
+            finally:
+                listing.close()
+            if (not isinstance(cursor, RestCursor)
+                    or cursor.result_md.get("queryState") != "COMPLETED"
+                    or cursor.result_md.get("attemptedAutoLimit") != 0):
+                return False
+            return bool(names) and all(isinstance(n, str) for n in names) \
+                and table_name not in names
+        except (exc.SQLAlchemyError, RequestException, ValueError, KeyError, TypeError):
+            return False
 
     @reflection.cache
     def get_plugin_type(self, connection, plugin=None, **kw):
