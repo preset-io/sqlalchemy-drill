@@ -67,6 +67,17 @@ class DrillDialect_sadrill(DrillDialect):
         import sqlalchemy_drill.drilldbapi as module  # pylint: disable=import-outside-toplevel
         return module
 
+    def is_disconnect(self, e, connection, cursor):
+        """Report REST transport failures and closed handles as disconnects.
+
+        Lets pool_pre_ping and SQLAlchemy's invalidation replace a pooled
+        connection whose HTTP session failed or was closed, instead of
+        handing it out again.
+        """
+        from sqlalchemy_drill.drilldbapi.api_exceptions import (  # pylint: disable=import-outside-toplevel
+            ConnectionClosedException, TransportError)
+        return isinstance(e, (TransportError, ConnectionClosedException))
+
     @classmethod
     def dbapi(cls):
         """Deprecated in SQLAlchemy, retained for backwards compatibility."""

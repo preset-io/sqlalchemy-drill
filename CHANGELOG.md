@@ -23,16 +23,34 @@
 - `Cursor.get_query_id()` raised `AttributeError`; it now returns the query
   ID once Drill has sent it, else `None`.
 
+- TLS certificates are now verified by default when `use_ssl` is set
+  (system trust store). `verify_ssl=<CA bundle path>` selects a CA bundle and
+  `verify_ssl=false` explicitly disables verification (logged as a warning).
+  Previously an HTTPS connection without `verify_ssl` accepted any certificate.
+- A streamed query no longer reads its whole response body into memory:
+  a debug log statement evaluated `Response.text` for every query, so
+  `stream_results` had no effect and memory grew with the result size. The
+  body is also parsed in 64 KiB chunks instead of one byte at a time.
+- REST transport failures (connection errors, resets, timeouts, including
+  mid-stream) raise DB-API `TransportError` (an `OperationalError`) instead of
+  raw `requests` exceptions, and the dialect reports them and closed
+  connections as disconnects. `pool_pre_ping` and SQLAlchemy invalidation now
+  replace a pooled connection whose HTTP session failed or was closed, instead
+  of handing it out and failing the first statement.
+- `Cursor.close()` works after its connection was closed or invalidated.
+
 ### Added
 
 - Opt-in `request_timeout=<seconds>` connection option (URL query parameter)
   applied to every REST request; a timeout raises `OperationalError`. Without
   it nothing changes: there is no client-side limit, as before.
-- `Cursor.cancel()` and `Connection.cancel_query(query_id)` cancel a running
-  query through Drill's `/profiles/cancel/{queryId}` endpoint. Drill's REST
-  API sends the query ID only with the first result batch, so a query that
-  has not produced a batch yet cannot be cancelled through REST;
-  `Cursor.cancel()` raises `NotSupportedError` in that case.
+- `Cursor.cancel()` cancels the statement the cursor is running, including
+  before Drill has sent any result (for example a long aggregation). Every
+  cursor statement carries a leading `/* sqlalchemy-drill:<tag> */` comment
+  with a per-cursor tag (`Cursor.query_tag`); `cancel()` finds that unique tag
+  in Drill's running-query list and calls `/profiles/cancel/{queryId}`.
+  `Connection.cancel_query(query_id)` and `Connection.cancel_tagged_query(tag)`
+  are also available, e.g. to cancel from another connection.
 - `get_view_definition()` returns the stored view SQL from
   `INFORMATION_SCHEMA.VIEWS` (bound schema and view name) instead of raising
   `NotImplementedError`; an unknown view raises `NoSuchTableError`.
