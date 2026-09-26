@@ -23,7 +23,7 @@ from __future__ import absolute_import
 from __future__ import unicode_literals
 import logging
 import re
-from time import sleep
+from time import monotonic, sleep
 from urllib.parse import quote, unquote
 
 from requests import RequestException
@@ -432,15 +432,33 @@ class DrillDialect(default.DefaultDialect):
         failure is raised rather than read as a missing view.
         """
         schema = self._schema_name(connection, schema)
-        rows = connection.execute(
-            text(
-                "SELECT `VIEW_DEFINITION` "
-                "FROM INFORMATION_SCHEMA.`VIEWS` "
-                "WHERE `TABLE_SCHEMA` = :schema "
-                "AND `TABLE_NAME` = :view_name"
-            ),
-            {"schema": schema, "view_name": view_name},
-        ).fetchall()
+        if schema is None:
+            # No schema argument and no database in the URL: binding NULL would
+            # never match. Search every schema and accept only a unique view.
+            rows = connection.execute(
+                text(
+                    "SELECT `TABLE_SCHEMA`, `VIEW_DEFINITION` "
+                    "FROM INFORMATION_SCHEMA.`VIEWS` "
+                    "WHERE `TABLE_NAME` = :view_name"
+                ),
+                {"view_name": view_name},
+            ).fetchall()
+            if len(rows) > 1:
+                raise exc.InvalidRequestError(
+                    f"View {view_name!r} exists in several schemas "
+                    f"({', '.join(sorted(row[0] for row in rows))}); pass schema="
+                )
+            rows = [(row[1],) for row in rows]
+        else:
+            rows = connection.execute(
+                text(
+                    "SELECT `VIEW_DEFINITION` "
+                    "FROM INFORMATION_SCHEMA.`VIEWS` "
+                    "WHERE `TABLE_SCHEMA` = :schema "
+                    "AND `TABLE_NAME` = :view_name"
+                ),
+                {"schema": schema, "view_name": view_name},
+            ).fetchall()
         if not rows:
             raise exc.NoSuchTableError(
                 f"{schema + '.' if schema else ''}{view_name}"
@@ -543,16 +561,24 @@ class DrillDialect(default.DefaultDialect):
         # on a busy server that window exceeded 0.3 s, and a provably absent
         # table then surfaced as the opaque DatabaseError. The opaque REST
         # text itself is identical for permission and other failures, so it
-        # is never evidence. Poll the profile with backoff (about 5 s in
-        # total) and never infer absence from a profile that remains unknown
-        # or cannot be fetched.
+        # is never evidence. Poll the profile with backoff (about 5 s of
+        # sleeps) and never infer absence from a profile that remains unknown
+        # or cannot be fetched. The whole poll, requests and sleeps, shares
+        # one budget: the connection's request_timeout, else 30 s.
+        budget = getattr(connection, "_request_timeout", None) or 30
+        started = monotonic()
         for delay in _PROFILE_RETRY_DELAYS:
             if delay:
+                if monotonic() - started + delay >= budget:
+                    return False
                 sleep(delay)
+            remaining = budget - (monotonic() - started)
+            if remaining <= 0:
+                return False
             try:
                 with connection._session.get(
                     f"{connection._base_url}/profiles/{quote(query_id, safe='')}.json",
-                    timeout=30,
+                    timeout=remaining,
                 ) as response:
                     response.raise_for_status()
                     profile = response.json()

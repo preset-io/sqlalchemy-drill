@@ -26,7 +26,7 @@ from urllib.parse import quote
 from ijson import parse
 from ijson.common import ObjectBuilder
 from requests import Session, Response
-from requests.exceptions import RequestException, Timeout
+from requests.exceptions import RequestException, SSLError, Timeout
 from uuid import uuid4
 
 from . import api_globals
@@ -243,9 +243,9 @@ class Cursor:
         self.result_md = {}
 
         self._is_open: bool = True
-        # One tag per cursor, stable for its lifetime: every statement it
-        # executes carries it, so a caller can cancel whichever is running.
-        self.query_tag: str = uuid4().hex
+        # Tag of the statement most recently started by execute(); a new
+        # tag per statement, so cancel() can only ever reach that statement.
+        self.query_tag: str = None
         self._result_event_stream = self._row_stream = None
         self._typecaster_list: list = None
 
@@ -393,16 +393,26 @@ class Cursor:
                 f'{self._default_storage_plugin}'
             )
 
-        resp = self.connection.submit_query(
-            f'/* {_QUERY_TAG_PREFIX}{self.query_tag} */ '
-            + self.substitute_in_query(operation, parameters)
-        )
+        tag = self.query_tag = uuid4().hex
+        try:
+            resp = self.connection.submit_query(
+                f'/* {_QUERY_TAG_PREFIX}{tag} */ '
+                + self.substitute_in_query(operation, parameters)
+            )
+        except TransportError as ex:
+            if getattr(ex, 'timed_out', False):
+                self.connection._cancel_after_timeout(tag)
+            raise
 
         if resp.status_code != 200:
             err_msg = resp.json().get('errorMessage', None)
             raise ProgrammingError(err_msg, resp.status_code)
 
-        self._result_event_stream = parse(RequestsStreamWrapper(resp))
+        on_failure = None
+        if self.connection._request_timeout:
+            def on_failure(tag=tag):
+                self.connection._cancel_after_timeout(tag)
+        self._result_event_stream = parse(RequestsStreamWrapper(resp, on_failure))
         row_data_present = self._outer_parsing_loop()
         # The leading result metadata has now been parsed.
 
@@ -516,11 +526,13 @@ class Cursor:
         """Ask Drill to cancel the statement this cursor is running.
 
         Safe to call from another thread, including while execute() is still
-        waiting for the first result batch. The statement is found by this
-        cursor's tag in Drill's running-query list. Returns True iff Drill
-        reports that it cancelled a query; False if nothing tagged by this
-        cursor is running.
+        waiting for the first result batch. Each execute() tags its statement
+        with a fresh ID, so only the cursor's most recent statement can be
+        cancelled. Returns True iff Drill reports that it cancelled it; False
+        if that statement is no longer (or not yet) running.
         """
+        if not self.query_tag:
+            return False
         return self.connection.cancel_tagged_query(self.query_tag)
 
     @is_open
@@ -610,10 +622,12 @@ class Connection:
                 stream=stream
             )
         except Timeout as ex:
-            raise TransportError(
+            error = TransportError(
                 f'Drill REST request timed out after {self._request_timeout} s',
                 None
-            ) from ex
+            )
+            error.timed_out = True
+            raise error from ex
         except RequestException as ex:
             raise _transport_error(ex, 'query request') from ex
 
@@ -717,6 +731,18 @@ class Connection:
                     f'{len(matches)} running queries carry tag {query_tag}', None)
         return None
 
+    def _cancel_after_timeout(self, query_tag: str):
+        """Best effort: stop the server query whose request timed out.
+
+        A client-side timeout does not stop Drill, so without this every
+        retried timeout would leave another copy of the query running.
+        """
+        try:
+            cancelled = self.cancel_tagged_query(query_tag)
+            logger.warning(f'request timed out; server query cancelled: {cancelled}')
+        except Exception as ex:  # never mask the original timeout
+            logger.warning(f'request timed out; cancelling the server query failed: {ex}')
+
     @connected
     def cancel_tagged_query(self, query_tag: str) -> bool:
         """Cancel the running query carrying query_tag (see Cursor.query_tag)."""
@@ -815,6 +841,24 @@ def connect(host: str,
         login = dict(url=f'{base_url}/j_security_check', data=payload)
     try:
         response = session.post(timeout=request_timeout, **login)
+    except SSLError as ex:
+        if verify_ssl is not False and 'CERTIFICATE_VERIFY_FAILED' in str(ex):
+            # Since 1.1.11.4 certificates are verified by default. Say how to
+            # trust a self-signed or private-CA server instead of failing with
+            # a bare SSL error; never fall back to an unverified connection.
+            raise TransportError(
+                f'TLS certificate verification failed for {base_url}: '
+                'the server certificate is not trusted by '
+                + ('the system trust store' if verify_ssl is True
+                   else f'the CA bundle {verify_ssl!r}')
+                + '. HTTPS connections verify certificates by default since '
+                'sqlalchemy-drill 1.1.11.4. For a self-signed or private-CA '
+                'certificate set verify_ssl=<path to the CA bundle that signed '
+                'it> in the connection URL. verify_ssl=false disables '
+                'verification and is not recommended.',
+                None
+            ) from ex
+        raise _transport_error(ex, 'login request') from ex
     except Timeout as ex:
         raise TransportError(
             f'Drill REST request timed out after {request_timeout} s', None
@@ -853,9 +897,10 @@ class RequestsStreamWrapper:
 
     _CHUNK = 65536
 
-    def __init__(self, resp: Response):
+    def __init__(self, resp: Response, on_failure=None):
         self._chunks = resp.iter_content(chunk_size=self._CHUNK)
         self._buffer = bytearray()
+        self._on_failure = on_failure
 
     def read(self, n=-1):
         try:
@@ -865,6 +910,8 @@ class RequestsStreamWrapper:
                     break
                 self._buffer += chunk
         except RequestException as ex:
+            if self._on_failure is not None:
+                self._on_failure()
             raise _transport_error(ex, 'result stream') from ex
         if n < 0:
             n = len(self._buffer)
