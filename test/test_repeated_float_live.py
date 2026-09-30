@@ -59,3 +59,20 @@ def test_scalar_float_and_decimal_unchanged(float_connection):
     assert all(type(value) is float for value in row[:5])
     assert math.isnan(row[2]) and row[3:6] == (math.inf, -math.inf, None)
     assert row[6] == Decimal('12.345') and type(row[6]) is Decimal
+
+
+def test_parquet_repeated_temporals(float_connection):
+    from datetime import date, time, datetime
+
+    float_connection.exec_driver_sql(
+        'ALTER SESSION SET `drill.exec.http.rest.errors.verbose` = true').fetchall()
+    result = float_connection.exec_driver_sql(
+        'SELECT dates, times, timestamps FROM '
+        'dfs.`/tmp/drill-repeated-temporal/temporal.parquet`')
+    assert result.cursor.result_md['metadata'] == ['DATE', 'TIME', 'TIMESTAMP']
+    assert result.fetchall() == [
+        ([date(1970, 1, 1), date(1970, 1, 2)],
+         [time(0, 0, 0, 123000), time(0, 0, 0, 456000)],
+         [datetime(1970, 1, 1, 0, 0, 0, 123000), datetime(1970, 1, 2, 0, 0, 0, 456000)]),
+        ([], [], []),
+    ]

@@ -96,3 +96,6 @@ ENV/
 # Python IDE
 .idea/
 /token.txt
+
+# Session-scoped Drill bind-mount fixtures (test/conftest.py)
+test/.drill-*/
