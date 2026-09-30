@@ -1950,3 +1950,22 @@ def test_rest_trailing_metadata_does_not_claim_float_typecasting(monkeypatch):
     row = cursor.fetchone()
     assert row == ([Decimal('1.5'), Decimal('2.5')],)
     assert all(type(item) is Decimal for item in row[0])
+
+
+@pytest.mark.parametrize('metadata,expected', [
+    ('DATE', datetime.date(1970, 1, 1)),
+    ('TIME', datetime.time(0, 0, 0, 123000)),
+    ('TIMESTAMP', datetime.datetime(1970, 1, 1, 0, 0, 0, 123000)),
+])
+def test_rest_repeated_temporal_columns(metadata, expected):
+    from decimal import Decimal
+
+    connection = _rest_connection_returning(
+        ['arr'], [metadata],
+        [{'arr': [123, None]}, {'arr': []}, {'arr': None},
+         {'arr': [[123], [None]]}, {'arr': {'raw': 1.25}}])
+    cursor = connection.cursor()
+    cursor.execute('SELECT arr FROM t')
+    assert cursor.fetchall() == [([expected, None],), ([],), (None,),
+                                 ([[expected], [None]],),
+                                 ({'raw': Decimal('1.25')},)]

@@ -1,3 +1,22 @@
+## [1.1.11.8] - unreleased
+
+### Fixed
+
+- REST fetches of repeated DATE, TIME and TIMESTAMP columns raised
+  `TypeError` (`unsupported type for timedelta milliseconds component:
+  list`) on Drill 1.19 and later, failing every fetch of the table. Drill
+  reports these columns with their scalar metadata, as it does for repeated
+  FLOAT columns. Every REST typecaster is now applied element by element to
+  lists (including nested lists), with nulls preserved. This was not a
+  regression: 1.1.11.3 and upstream also crashed on these columns.
+
+### Changed
+
+- Map values are returned exactly as the JSON decoder produced them, because
+  a map's metadata does not describe its values. A FLOAT array inside a map
+  therefore still holds `Decimal` values, whereas the same array at the top
+  level decodes to `float`.
+
 ## [1.1.11.7] - unreleased
 
 ### Fixed

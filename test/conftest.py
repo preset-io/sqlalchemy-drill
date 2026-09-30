@@ -74,7 +74,7 @@ def drill_auth_file():
 
 
 @pytest.fixture(scope="session")
-def drill_container(drill_auth_file):
+def drill_container(drill_auth_file, repeated_temporal_directory):
     if os.environ.get("DRILL_RUN_REST_INTEGRATION") != "1":
         pytest.skip("set DRILL_RUN_REST_INTEGRATION=1 for Apache Drill tests")
     # Once the run has explicitly opted in, a missing dependency is a failure
@@ -93,6 +93,7 @@ def drill_container(drill_auth_file):
     )
     drill_container.with_exposed_ports(8047)\
         .with_volume_mapping(test_dir/"drill-override.conf", "/opt/drill/conf/drill-override.conf")\
+        .with_volume_mapping(repeated_temporal_directory, "/tmp/drill-repeated-temporal")\
         .with_volume_mapping(drill_auth_file, "/opt/drill/conf/htpasswd")\
         .with_kwargs(entrypoint="/bin/bash")\
         .with_command(["-c", "$DRILL_HOME/bin/drill-embedded -n dbapi -p foo -f <(sleep infinity)"])
@@ -106,3 +107,19 @@ def drill_container(drill_auth_file):
         yield drill_container
     finally:
         drill_container.stop()
+
+
+@pytest.fixture(scope="session")
+def repeated_temporal_directory():
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    with TemporaryDirectory(prefix=".drill-temporal-", dir=Path(__file__).parent) as directory:
+        os.chmod(directory, 0o755)
+        table = pa.table({
+            'dates': pa.array([[0, 1], []], type=pa.list_(pa.date32())),
+            'times': pa.array([[123, 456], []], type=pa.list_(pa.time32('ms'))),
+            'timestamps': pa.array([[123, 86400456], []], type=pa.list_(pa.timestamp('ms'))),
+        })
+        pq.write_table(table, Path(directory) / 'temporal.parquet')
+        yield str(Path(directory).resolve())

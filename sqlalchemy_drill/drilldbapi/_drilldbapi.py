@@ -613,9 +613,9 @@ class Connection:
         if self.drill_version >= '1.19':
             # Starting in 1.19 the Drill REST API returns UNIX times
             self.python_typecasters.update({
-                'DATE': DateFromTicks,
-                'TIME': TimeFromTicks,
-                'TIMESTAMP': TimestampFromTicks
+                'DATE': _elementwise(DateFromTicks),
+                'TIME': _elementwise(TimeFromTicks),
+                'TIMESTAMP': _elementwise(TimestampFromTicks)
             })
             logger.debug('sets up typecasting functions for Drill >= 1.19.')
 
@@ -1085,19 +1085,33 @@ _DECIMAL_SIZE = re.compile(
     r'\s*(?:VAR)?DECIMAL\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)\s*', re.IGNORECASE)
 
 
-def _float_from_json(value):
-    """Decode a Drill FLOAT4/FLOAT8 REST value to a Python float.
+def _elementwise(cast):
+    """Apply a scalar REST typecaster to repeated columns as well.
 
-    Finite values are JSON numbers (parsed as Decimal); Drill writes NaN and
-    the infinities as the strings "NaN", "Infinity" and "-Infinity", which
-    float() accepts. Repeated columns use the same metadata as scalars but
-    carry JSON lists. Maps retain their own nested types and are not floats.
+    Drill reports a repeated column with its element type's metadata (for
+    example FLOAT8 or TIMESTAMP) but sends a JSON list, possibly nested.
+    Each element is converted individually. Maps are returned as the JSON
+    decoder produced them, since their metadata does not describe their
+    values.
     """
-    if isinstance(value, list):
-        return [_float_from_json(item) for item in value]
-    if isinstance(value, dict):
-        return value
+    def convert(value):
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if isinstance(value, dict):
+            return value
+        return cast(value)
+    return convert
+
+
+def _float_from_json_scalar(value):
+    # Finite values are JSON numbers (parsed as Decimal); Drill writes NaN
+    # and the infinities as the strings "NaN", "Infinity" and "-Infinity",
+    # which float() accepts.
     return None if value is None else float(value)
+
+
+# Decode a Drill FLOAT4/FLOAT8 REST value, scalar or repeated, to Python floats.
+_float_from_json = _elementwise(_float_from_json_scalar)
 
 
 def DateFromTicks(ticks):
